@@ -24,7 +24,7 @@ gdt64:
     .quad 0
 	.set code_seg, . - gdt64
     .quad (1<<43) | (1<<44) | (1<<47) | (1<<53)
-gdt64_pointer:
+gdt64_ptr:
     .word . - gdt64 - 1
     .quad gdt64
 
@@ -37,7 +37,7 @@ _start:
     call setup_page_tables
     call enable_paging
 
-    lgdt (gdt64_pointer)
+    lgdt (gdt64_ptr)
     jmp $code_seg, $long_mode_start
 
 setup_page_tables:
