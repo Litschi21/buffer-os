@@ -94,8 +94,29 @@ void idt_init() {
 	__asm__ __volatile__ ("sti");
 }
 
+static inline void outb(uint16_t port, uint8_t val) {
+	__asm__ __volatile__ ("outb %0, %1" : : "a"(val), "Nd"(port));
+}
+
+volatile uint64_t timer_ticks{};
+extern "C" void timer_handler() { ++timer_ticks; }
+void pit_set_freq(uint32_t freq) {
+	uint32_t div{ 1'193'182 / freq };
+
+	outb(0x43, 0x36);
+	outb(0x40, div & 0xFF);
+	outb(0x40, (div >> 8) & 0xFF);
+}
+
+void sleep(uint64_t ms) {
+	uint64_t target{ timer_ticks + (ms / 10) };
+	while (timer_ticks < target)
+		__asm__ __volatile__("hlt");
+}
+
 extern "C" void kernel_main() {
 	init_gdt();
+	pit_set_freq(200);
 
 	volatile char* video{ reinterpret_cast<volatile char*>(0xB8000) };
 	const char* msg{ "Buffer OS" };
