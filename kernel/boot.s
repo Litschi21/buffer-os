@@ -24,6 +24,7 @@ gdt64:
     .quad 0
 	.set code_seg, . - gdt64
     .quad (1<<43) | (1<<44) | (1<<47) | (1<<53)
+
 gdt64_ptr:
     .word . - gdt64 - 1
     .quad gdt64
@@ -50,6 +51,7 @@ setup_page_tables:
     mov %eax, (p3_table)
 
     mov $0, %ecx
+
 .map_p2_table:
     mov $0x200000, %eax
     mul %ecx
