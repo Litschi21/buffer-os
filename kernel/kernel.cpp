@@ -1,21 +1,41 @@
 #include <stdint.h>
 
-struct gdt_entry_bits {
+struct __attribute__((packed)) gdt_entry {
 	uint16_t lim_low;
 	uint16_t base_low;
 	uint8_t  base_mid;
 	uint8_t  access;
 	uint8_t  gran;
 	uint8_t  base_high;
-} __attribute__((packed));
+};
 
-struct gdt_ptr_bits {
+struct __attribute__((packed)) gdt_ptr {
 	uint16_t lim;
 	uint64_t base;
-} __attribute__((packed));
+};
 
-struct gdt_entry_bits gdt[3];
-struct gdt_ptr_bits   gdt_ptr;
+struct gdt_entry gdt[3];
+struct gdt_ptr   gdt_ptr;
+
+
+struct __attribute__((packed)) idt_entry {
+	uint16_t isr_low;
+	uint16_t kernel_cs;
+	uint8_t  ist;
+	uint8_t  attributes;
+	uint16_t isr_mid;
+	uint16_t isr_high;
+	uint32_t reserved;
+};
+
+struct __attribute__((packed)) idtr_t {
+	uint16_t lim;
+	uint32_t base;
+};
+
+static idt_entry idt[256];
+static idtr_t    idtr;
+
 
 void gdt_set_gate(int32_t idx, uint32_t base, uint32_t lim, uint8_t access, uint8_t flags) {
 	if (idx >= 3) return;
@@ -31,11 +51,9 @@ void gdt_set_gate(int32_t idx, uint32_t base, uint32_t lim, uint8_t access, uint
 	gdt[idx].access    = access;
 }
 
-
 extern "C" void gdt_flush(uint64_t gdt_ptr_addr);
-
 void init_gdt() {
-	gdt_ptr.lim  = (sizeof(struct gdt_entry_bits) * 3) - 1;
+	gdt_ptr.lim  = (sizeof(struct gdt_entry) * 3) - 1;
 	gdt_ptr.base = reinterpret_cast<uint64_t>(&gdt);
 
 	gdt_set_gate(0, 0, 0, 0, 0);
@@ -43,6 +61,37 @@ void init_gdt() {
 	gdt_set_gate(2, 0, 0xFFFFFFFF, 0x92, 0xCF);
 
 	gdt_flush(reinterpret_cast<uint64_t>(&gdt_ptr));
+}
+
+extern "C" void exception_handler() {
+	__asm__ __volatile__ ("cli; hlt");
+}
+
+void idt_set_descriptor(uint8_t v, void *isr, uint8_t flags) {
+	idt_entry *descriptor{ &idt[v] };
+
+	descriptor->isr_low    = reinterpret_cast<uint64_t>(isr) & 0xFFFF;
+	descriptor->kernel_cs  = 0x08;
+	descriptor->ist        = 0;
+	descriptor->attributes = flags;
+	descriptor->isr_mid    = (reinterpret_cast<uint64_t>(isr) >> 16) & 0xFFFF;
+	descriptor->isr_high   = (reinterpret_cast<uint64_t>(isr) >> 32) & 0xFFFFFFFF;
+	descriptor->reserved   = 0;
+}
+
+static bool vectors[256];
+extern "C" void *isr_stub_table[];
+
+void idt_init() {
+	idtr.base = reinterpret_cast<uintptr_t>(&idt[0]);
+	idtr.lim  = static_cast<uint16_t>(sizeof(idt_entry) * 256 - 1);
+	for (uint8_t v{}; v < 32; ++v) {
+		idt_set_descriptor(v, isr_stub_table[v], 0x8E);
+		vectors[v] = true;
+	}
+
+	__asm__ __volatile__ ("lidt %0" : : "m"(idtr));
+	__asm__ __volatile__ ("sti");
 }
 
 extern "C" void kernel_main() {
