@@ -1,5 +1,9 @@
 #include <stdint.h>
 
+#define KB_BUFFER_SIZE 256
+#define GDT_SIZE       3
+#define IDT_SIZE       256
+
 struct __attribute__((packed)) gdt_entry {
 	uint16_t lim_low;
 	uint16_t base_low;
@@ -14,7 +18,7 @@ struct __attribute__((packed)) gdt_ptr {
 	uint64_t base;
 };
 
-struct gdt_entry gdt[3];
+struct gdt_entry gdt[GDT_SIZE];
 struct gdt_ptr   gdt_ptr;
 
 
@@ -24,16 +28,16 @@ struct __attribute__((packed)) idt_entry {
 	uint8_t  ist;
 	uint8_t  attributes;
 	uint16_t isr_mid;
-	uint16_t isr_high;
+	uint32_t isr_high;
 	uint32_t reserved;
 };
 
 struct __attribute__((packed)) idtr_t {
 	uint16_t lim;
-	uint32_t base;
+	uint64_t base;
 };
 
-static idt_entry idt[256];
+static idt_entry idt[IDT_SIZE];
 static idtr_t    idtr;
 
 
@@ -67,6 +71,7 @@ extern "C" void exception_handler() {
 	__asm__ __volatile__ ("cli; hlt");
 }
 
+extern "C" void remap_pic();
 void idt_set_descriptor(uint8_t v, void *isr, uint8_t flags) {
 	idt_entry *descriptor{ &idt[v] };
 
@@ -79,18 +84,26 @@ void idt_set_descriptor(uint8_t v, void *isr, uint8_t flags) {
 	descriptor->reserved   = 0;
 }
 
-static bool vectors[256];
+static bool vectors[IDT_SIZE];
 extern "C" void *isr_stub_table[];
 
-void idt_init() {
+extern "C" void timer_isr();
+extern "C" void keyboard_isr();
+
+void init_idt() {
+	idtr.lim  = static_cast<uint16_t>(sizeof(idt_entry) * IDT_SIZE - 1);
 	idtr.base = reinterpret_cast<uintptr_t>(&idt[0]);
-	idtr.lim  = static_cast<uint16_t>(sizeof(idt_entry) * 256 - 1);
+
 	for (uint8_t v{}; v < 32; ++v) {
 		idt_set_descriptor(v, isr_stub_table[v], 0x8E);
 		vectors[v] = true;
 	}
 
 	__asm__ __volatile__ ("lidt %0" : : "m"(idtr));
+	
+	idt_set_descriptor(32, reinterpret_cast<void*>(timer_isr), 0x8E);
+	idt_set_descriptor(33, reinterpret_cast<void*>(keyboard_isr), 0x8E);
+
 	__asm__ __volatile__ ("sti");
 }
 
@@ -98,8 +111,15 @@ static inline void outb(uint16_t port, uint8_t val) {
 	__asm__ __volatile__ ("outb %0, %1" : : "a"(val), "Nd"(port));
 }
 
+static inline uint8_t inb(uint16_t port) {
+	uint8_t ret;
+	__asm__ __volatile__ ("inb %1, %0" : "=a"(ret) : "Nd"(port));
+	return ret;
+}
+
 volatile uint64_t timer_ticks{};
-extern "C" void timer_handler() { ++timer_ticks; }
+extern "C" void timer_handler() { outb(0x20, 0x20); ++timer_ticks; }
+
 void pit_set_freq(uint32_t freq) {
 	uint32_t div{ 1'193'182 / freq };
 
@@ -114,8 +134,48 @@ void sleep(uint64_t ms) {
 		__asm__ __volatile__("hlt");
 }
 
+static const char scancode_ascii[128]{
+	0,  27, '1','2','3','4','5','6','7','8','9','0','-','=','\b',
+    '\t','q','w','e','r','t','y','u','i','o','p','[',']','\n',
+    0, 'a','s','d','f','g','h','j','k','l',';','\'','`',
+    0, '\\','z','x','c','v','b','n','m',',','.','/', 0,
+    '*', 0, ' ', 0
+};
+
+static char kb_buffer[KB_BUFFER_SIZE];
+static volatile int kb_head{};
+static volatile int kb_tail{};
+
+bool kb_empty() { return kb_head == kb_tail; }
+void kb_push(const char c) {
+	int next{ (kb_head + 1) % KB_BUFFER_SIZE };
+	if (next != kb_tail) {
+		kb_buffer[kb_head] = c;
+		kb_head = next;
+	}
+}
+
+char kb_read() {
+	char c{ kb_buffer[kb_tail] };
+	kb_tail = (kb_tail + 1) % KB_BUFFER_SIZE;
+	return c;
+}
+
+extern "C" void keyboard_handler() {
+	uint8_t scancode{ inb(0x60) };
+	if (!(scancode & 0x80)) {
+		char c{ scancode_ascii[scancode & 0x7F] };
+		if (c != 0)
+			kb_push(c);
+	}
+
+	outb(0x20, 0x20);
+}
+
 extern "C" void kernel_main() {
 	init_gdt();
+	remap_pic();
+	init_idt();
 	pit_set_freq(200);
 
 	volatile char* video{ reinterpret_cast<volatile char*>(0xB8000) };
@@ -125,5 +185,7 @@ extern "C" void kernel_main() {
 		video[i * 2 + 1] = 0x0F;
 	}
 
-	while (true) { asm volatile("hlt"); }
+	while (true) {
+		__asm__ __volatile__("hlt");
+	}
 }
