@@ -11,6 +11,7 @@
 .long CHECKSUM
 
 .section .bss
+multiboot_info_ptr: .skip 4
 .align 4096
 p4_table: .skip 4096
 p3_table: .skip 4096
@@ -31,8 +32,10 @@ gdt64_ptr:
 
 .section .text
 .global _start
+
 .code32
 _start:
+	mov %ebx, multiboot_info_ptr
     mov $stack_top, %esp
 
     call setup_page_tables
@@ -89,7 +92,9 @@ long_mode_start:
     mov %ax, %fs
     mov %ax, %gs
 
+	mov multiboot_info_ptr(%rip), %edi
     call kernel_main
+
     cli
 1:  hlt
     jmp 1b
