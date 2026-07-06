@@ -9,6 +9,7 @@
 #define VID_ROWS                  25
 #define INIT_HEAP_FRAMES          1000
 #define MIN_MALLOC_SIZE           40
+#define THREAD_STACK_SIZE         4096
 
 volatile char *video{ reinterpret_cast<volatile char*>(0xB8000) };
 int v_pos{};
@@ -268,24 +269,22 @@ void handleCmd(const char *cmd, const char *args[MAX_ARG_CNT]) {
 			video[i] = 0;
 		
 		v_pos = 0;
-		print("BufferOS", true);
+		print("BufferOS\n");
 	}
 	else if (strEqual(cmd, "echo")) {
 		for (uint64_t i{ 1 }; i < MAX_ARG_CNT && args[i] != nullptr; ++i) {
-			printCh('\n', false);
-			print(args[i], false);
-			printCh(' ', false);
+			print(args[i]);
+			printCh('\n');
 		}
 	}
 	else if (strEqual(cmd, "uptime")) {
 		char buf[12];
 
-		printCh('\n');
 		print(to_string(timer_ticks / PIT_FREQ, buf));
-		printCh('s', true);
+		print("s\n");
 	}
 	else if (strEqual(cmd, "ver"))
-		print("\nBufferOS Pre-Alpha");
+		print("BufferOS Pre-Alpha\n");
 	else if (strEqual(cmd, "panic")) {
 		panic("Manually triggered by User.");
 	}
@@ -583,6 +582,59 @@ void kfree(const uint64_t addr) {
 		}
 	}
 }
+
+
+// Kernel-mode Structs & Scheduling
+int next_pid{};
+
+struct cpu_context {
+    uint64_t rax, rbx, rcx, rdx;
+    uint64_t rsi, rdi, rbp;
+    uint64_t rsp;
+    uint64_t rip;
+    uint64_t rflags;
+};
+
+struct task_t {
+	int pid;
+	uint8_t state;
+	void *stack_top;
+	struct cpu_context ctx;
+	struct task_t *next;
+};
+
+task_t *create_task(void (*entry_point)()) {
+	task_t *task{ reinterpret_cast<task_t*>(kmalloc(sizeof(task_t))) };
+	if (!task) return nullptr;
+
+	void *stack_bot{ reinterpret_cast<void*>(kmalloc(THREAD_STACK_SIZE)) };
+	if (!stack_bot) {
+		kfree(reinterpret_cast<uint64_t>(task));
+		return nullptr;
+	}
+	
+	task->stack_top = reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(stack_bot) + THREAD_STACK_SIZE);
+	task->pid = next_pid++;
+	task->state = 0;
+	task->next = nullptr;
+
+	task->ctx.rip = reinterpret_cast<uintptr_t>(entry_point);
+	task->ctx.rsp = reinterpret_cast<uintptr_t>(task->stack_top);
+
+	task->ctx.rflags = 0x0202;
+
+	task->ctx.rax = 0;
+    task->ctx.rbx = 0;
+    task->ctx.rcx = 0;
+    task->ctx.rdx = 0;
+    task->ctx.rsi = 0;
+    task->ctx.rdi = 0;
+    task->ctx.rbp = reinterpret_cast<uintptr_t>(task->stack_top);
+
+	return task;
+}
+
+extern "C" void switch_context(struct cpu_context *old_ctx, struct cpu_context *new_ctx);
 
 extern "C" void kernel_main(uint32_t multiboot_info_addr) {
 	parse_memmap(reinterpret_cast<multiboot_info*>(multiboot_info_addr));
