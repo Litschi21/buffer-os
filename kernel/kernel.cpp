@@ -1,12 +1,14 @@
 #include <stdint.h>
 
-#define KB_BUFFER_SIZE  256
-#define GDT_SIZE        3
-#define IDT_SIZE        256
-#define PIT_FREQ        200
-#define VID_BFR_ROW_LEN 160
-#define MAX_ARG_CNT     16
-#define VID_ROWS        25
+#define KB_BUFFER_SIZE            256
+#define GDT_SIZE                  3
+#define IDT_SIZE                  256
+#define PIT_FREQ                  200
+#define VID_BFR_ROW_LEN           160
+#define MAX_ARG_CNT               16
+#define VID_ROWS                  25
+#define INIT_HEAP_FRAMES          1000
+#define MIN_MALLOC_SIZE           40
 
 volatile char *video{ reinterpret_cast<volatile char*>(0xB8000) };
 int v_pos{};
@@ -128,7 +130,7 @@ static inline uint8_t inb(uint16_t port) {
 }
 
 volatile uint64_t timer_ticks{};
-extern "C" void timer_handler() { outb(0x20, 0x20); ++timer_ticks; }
+extern "C" void timer_handler() { outb(0x20, 0x20); timer_ticks += 1; }
 
 void pit_set_freq(uint32_t freq) {
 	uint32_t div{ 1'193'182 / freq };
@@ -206,7 +208,7 @@ int strlen(const char *str) {
 	return len;
 }
 
-char *to_string(int n, char *buf) {
+char *to_string(int64_t n, char *buf) {
 	bool neg{ n < 0 };
 	if (neg) n = -n;
 
@@ -228,8 +230,8 @@ char *to_string(int n, char *buf) {
 	return buf;
 }
 
-void printCh(char c, bool await_input=false, bool check_cmd=true, const int color_code=0x0F);
-void print(const char *msg, bool await_input=false, bool check_cmd=true, const int color_code=0x0F);
+void printCh(char c, bool await_input=false, const int color_code=0x0F);
+void print(const char *msg, bool await_input=false, const int color_code=0x0F);
 [[noreturn]] void panic(const char *msg) {
 	__asm__ __volatile__("cli");
 
@@ -239,12 +241,12 @@ void print(const char *msg, bool await_input=false, bool check_cmd=true, const i
 	}
 	v_pos = 0;
 
-	print("*** KERNEL PANIC ***\n\n", false, true, 0x1F);
-	print(msg, false, true, 0x1F);
+	print("*** KERNEL PANIC ***\n\n", false, 0x1F);
+	print(msg, false, 0x1F);
 
 	char buf[12];
-	print("\n\nSystem halted at tick ", false, true, 0x1F);
-	print(to_string(timer_ticks, buf), false, false, 0x1F);
+	print("\n\nSystem halted at tick ", false, 0x1F);
+	print(to_string(timer_ticks, buf), false, 0x1F);
 	
 	while (true) {
 		__asm__ __volatile__("hlt");
@@ -253,88 +255,93 @@ void print(const char *msg, bool await_input=false, bool check_cmd=true, const i
 
 void handleCmd(const char *cmd, const char *args[MAX_ARG_CNT]) {
 	if (strEqual(cmd, "help")) {
-		print("\nThis is BufferOS, a small hobby OS designed for Programmers.\n", false, false);
-		print("help     Prints all commands along with their descriptions.\n", false, false);
+		print("This is BufferOS, a small hobby OS designed for Programmers.\n");
+		print("help     Prints all commands along with their descriptions.\n");
 		print("clear    Clears the shell.\n");
 		print("echo     Prints all given arguments.\n");
 		print("uptime   Prints the uptime of the OS in seconds.\n");
 		print("ver      Prints the current version of BufferOS.\n");
-		print("panic    Deliberately causes a Kernel Panic.\n");
+		print("panic    Deliberately causes a Kernel Panic.\n\n");
 	}
 	else if (strEqual(cmd, "clear")) {
 		for (int i{}; i < v_pos; ++i)
 			video[i] = 0;
 		
 		v_pos = 0;
-		print("BufferOS", true, false);
+		print("BufferOS", true);
 	}
 	else if (strEqual(cmd, "echo")) {
 		for (uint64_t i{ 1 }; i < MAX_ARG_CNT && args[i] != nullptr; ++i) {
-			printCh('\n', false, false);
-			print(args[i], false, false);
-			printCh(' ', false, false);
+			printCh('\n', false);
+			print(args[i], false);
+			printCh(' ', false);
 		}
 	}
 	else if (strEqual(cmd, "uptime")) {
 		char buf[12];
 
-		printCh('\n', false, false);
-		print(to_string(timer_ticks / PIT_FREQ, buf), false, false);
-		printCh('s', true, false);
+		printCh('\n');
+		print(to_string(timer_ticks / PIT_FREQ, buf));
+		printCh('s', true);
 	}
 	else if (strEqual(cmd, "ver"))
-		print("\nBufferOS Pre-Alpha", false, false);
+		print("\nBufferOS Pre-Alpha");
 	else if (strEqual(cmd, "panic")) {
 		panic("Manually triggered by User.");
 	}
 }
 
-void printCh(char c, const bool await_input, const bool check_cmd, const int color_code) {
-	if (c == '\n') {
-		if (check_cmd) {
-			for (const char *cmd : commands) {
-				const char *args[MAX_ARG_CNT];
-				uint64_t arg_idx{};
+void parseCmd() {
+	const char *args[MAX_ARG_CNT];
+	char word_buffer[MAX_ARG_CNT][256];
+	uint64_t arg_idx{};
+	uint64_t char_idx{};
 
-				char word_buffer[MAX_ARG_CNT][256];
-				uint64_t char_idx{};
+	for (int i{}; curr_input[i] != '\0'; ++i) {
+		char curr_ch{ curr_input[i] };
 
-				for (int i{}; curr_input[i] != '\0'; ++i) {
-					char c{ curr_input[i] };
+		if (curr_ch != ' ') {
+			if (char_idx < sizeof(word_buffer[0]) - 1)
+				word_buffer[arg_idx][char_idx++] = curr_ch;
+		}
+		else {
+			if (char_idx > 0) {
+				word_buffer[arg_idx][char_idx] = '\0';
+				args[arg_idx] = word_buffer[arg_idx];
+				++arg_idx;
 
-					if (c != ' ') {
-						if (char_idx < sizeof(word_buffer[0]) - 1)
-							word_buffer[arg_idx][char_idx++] = c;
-					}
-					else {
-						if (char_idx > 0) {
-							word_buffer[arg_idx][char_idx] = '\0';
-							args[arg_idx] = word_buffer[arg_idx];
-							++arg_idx;
-
-							char_idx = 0;
-							if (arg_idx >= MAX_ARG_CNT) break;
-						}
-					}
-				}
-
-				if (char_idx > 0 && arg_idx < MAX_ARG_CNT) {
-					word_buffer[arg_idx][char_idx] = '\0';
-					args[arg_idx] = word_buffer[arg_idx];
-					++arg_idx;
-				}
-
-				if (arg_idx < MAX_ARG_CNT) {
-					args[arg_idx] = nullptr;
-				}
-
-				if (arg_idx > 0 && strEqual(args[0], cmd)) {
-					handleCmd(args[0], args);
-					break;
-				}
+				char_idx = 0;
+				if (arg_idx >= MAX_ARG_CNT) break;
 			}
 		}
+	}
 
+	if (char_idx > 0 && arg_idx < MAX_ARG_CNT) {
+        word_buffer[arg_idx][char_idx] = '\0';
+        args[arg_idx] = word_buffer[arg_idx];
+        ++arg_idx;
+    }
+
+	if (arg_idx == 0) return;
+
+	bool found{ false };
+	for (const char *cmd : commands) {
+		if (strEqual(args[0], cmd)) {
+			handleCmd(args[0], args);
+			found = true;
+			break;
+		}
+	}
+
+	if (!found) {
+		printCh('\'', false);
+		print(args[0], false);
+		print("' does not match any command. Check 'help' to see all commands.\n", false);
+	}
+}
+
+void printCh(char c, const bool await_input, const int color_code) {
+	if (c == '\n') {
 		v_pos += VID_BFR_ROW_LEN - v_pos % VID_BFR_ROW_LEN;
 		if (v_pos > VID_BFR_ROW_LEN * (VID_ROWS - 1)) {
 			for (int i{ 1 }; i < VID_ROWS; ++i) {
@@ -353,11 +360,7 @@ void printCh(char c, const bool await_input, const bool check_cmd, const int col
 		}
 
 		if (await_input) {
-			print("> ", false, false);
-
-			line_len = 0;
-			for (int i{}; i < strlen(curr_input); ++i)
-				curr_input[i] = '\0';
+			print("> ", false);
 		}
 	}
 	else if (c == '\b') {
@@ -366,8 +369,8 @@ void printCh(char c, const bool await_input, const bool check_cmd, const int col
 		else
 			v_pos -= 2;
 
-		video[v_pos + 1] = 0;
-		video[v_pos]     = 0;
+		video[v_pos]     = ' ';
+		video[v_pos + 1] = 0x0F;
 
 		if (line_len > 0) {
 			--line_len;
@@ -375,19 +378,15 @@ void printCh(char c, const bool await_input, const bool check_cmd, const int col
 		}
 	}
 	else {
-		curr_input[line_len] = c;
-		++line_len;
-		curr_input[line_len] = '\0';
-
 		video[v_pos]     = c;
 		video[v_pos + 1] = color_code;
 		v_pos += 2;
 	}
 }
 
-void print(const char *msg, const bool await_input, const bool check_cmd, const int color_code) {
+void print(const char *msg, const bool await_input, const int color_code) {
 	for (int i{}; msg[i] != '\0'; ++i) {
-		printCh(msg[i], await_input, check_cmd, color_code);
+		printCh(msg[i], await_input, color_code);
 	}
 }
 
@@ -413,6 +412,24 @@ struct __attribute__((packed)) mmap_entry {
     uint32_t type;
 };
 
+struct chunk_header {
+	uint64_t size;
+	bool     is_free;
+};
+
+struct chunk_footer {
+	uint64_t size;
+};
+
+static uint64_t highest_addr{};
+static uint64_t total_frames;
+static uint64_t bitmap_size_bytes;
+static uint64_t heap_start;
+static uint64_t heap_end;
+
+extern uint8_t _kernel_end;
+uint8_t* bitmap{ &_kernel_end };
+
 void parse_memmap(multiboot_info* mbi) {
 	if (!(mbi->flags & (1 << 6)))
 		panic("No memory map provided by bootloader.");
@@ -422,14 +439,155 @@ void parse_memmap(multiboot_info* mbi) {
 
 	while (addr < end) {
 		mmap_entry* entry{ reinterpret_cast<mmap_entry*>(addr) };
-		if (entry->type == 1) {}
-
+		if (entry->type == 1) {
+			uint64_t entry_end{ entry->addr + entry->len };
+			if (entry_end > highest_addr)
+				highest_addr = entry_end;
+		}
+		
 		addr += entry->size + sizeof(entry->size);
+	}
+
+	total_frames =      highest_addr / 4096;
+	bitmap_size_bytes = total_frames / 8;
+}
+
+uint64_t alloc_frame() {
+	for (uint64_t frame{}; frame < total_frames; ++frame) {
+		uint64_t byte_idx{ frame / 8 };
+		uint8_t  bit_idx { static_cast<uint8_t>(frame % 8) };
+		
+		uint8_t bit_val{ static_cast<uint8_t>((bitmap[byte_idx] >> bit_idx) & 1) };
+		if (bit_val == 0) {
+			bitmap[byte_idx] |= (1 << bit_idx);
+			return frame * 4096;
+		}
+	}
+
+	panic("Out of physical memory");
+}
+
+void free_frame(const uint64_t addr) {
+	uint64_t frame{ addr / 4096 };
+	uint64_t byte_idx{ frame / 8 };
+	uint8_t  bit_idx { static_cast<uint8_t>(frame % 8) };
+
+	if (!((bitmap[byte_idx] >> bit_idx) & 1))
+		panic("Attempted to double free memory");
+
+	bitmap[byte_idx] &= ~(1 << bit_idx);
+}
+
+uint64_t next_header(const uint64_t size) { return size + sizeof(chunk_header); }
+void write_footer(const uint64_t header_addr, const uint64_t size) {
+	chunk_footer *f{ reinterpret_cast<chunk_footer*>(size + header_addr + sizeof(chunk_header)) };
+	f->size = size;
+}
+
+void init_bitmap() {
+	for (uint64_t i{}; i < bitmap_size_bytes; ++i) {
+		bitmap[i] = 0;
+	}
+
+	uint64_t bitmap_end_addr   { reinterpret_cast<uint64_t>(&_kernel_end) + bitmap_size_bytes };
+	uint64_t total_reserved    { (bitmap_end_addr + 4095) / 4096 };
+
+	for (uint64_t frame{}; frame < total_reserved; ++frame) {
+		bitmap[frame / 8] |= (1 << (frame % 8));
+	}
+}
+
+void init_heap() {
+	heap_start = alloc_frame();
+	for (int i{}; i < INIT_HEAP_FRAMES - 1; ++i) {
+		alloc_frame();
+	}
+
+	heap_end = heap_start + INIT_HEAP_FRAMES * 4096;
+	chunk_header *first{ reinterpret_cast<chunk_header*>(heap_start) };
+	first->size = (INIT_HEAP_FRAMES * 4096) - sizeof(chunk_header);
+	first->is_free = true;
+
+	write_footer(heap_start, first->size);
+}
+
+uint64_t kmalloc(const uint64_t size) {
+	uint64_t addr{ heap_start };
+	while (addr < heap_end) {
+		chunk_header *curr{ reinterpret_cast<chunk_header*>(addr) };
+		if (!curr->is_free) {
+			addr += sizeof(chunk_footer) + next_header(curr->size);
+			continue;
+		}
+
+		if (curr->size >= size) {
+			if (curr->size - size < MIN_MALLOC_SIZE) {
+				curr->is_free = false;
+				return addr + sizeof(chunk_header);
+			}
+			else {
+				uint64_t new_size{ curr->size - size - sizeof(chunk_header) - sizeof(chunk_footer) };
+				curr->size = size;
+
+				uint64_t new_header_addr{ addr + next_header(curr->size) + sizeof(chunk_footer) };
+				chunk_header *new_header{ reinterpret_cast<chunk_header*>(new_header_addr) };
+				new_header->size = new_size;
+				new_header->is_free = true;
+
+				uint64_t new_footer_addr{ new_header_addr + next_header(new_header->size) };
+				chunk_footer *new_footer{ reinterpret_cast<chunk_footer*>(new_footer_addr) };
+				new_footer->size = new_size;
+
+				chunk_footer *curr_footer{ reinterpret_cast<chunk_footer*>(addr + curr->size + sizeof(chunk_header)) };
+				curr_footer->size = curr->size;
+
+				curr->is_free = false;
+				return addr + sizeof(chunk_header);
+			}
+		}
+
+		addr += next_header(curr->size);
+	}
+
+	panic("Out of heap space");
+}
+
+void kfree(const uint64_t addr) {
+	chunk_header *header{ reinterpret_cast<chunk_header*>(addr - sizeof(chunk_header)) };
+	if (header->is_free)
+		panic("Attempted to double free heap space");
+	else {
+		header->is_free = true;
+		
+		uint64_t next_addr{ addr + header->size + sizeof(chunk_footer) };
+		if (next_addr < heap_end) {
+			chunk_header *next{ reinterpret_cast<chunk_header*>(next_addr) };
+			if (next->is_free) {
+				header->size += next->size + sizeof(chunk_header) + sizeof(chunk_footer);
+				chunk_footer *new_f{ reinterpret_cast<chunk_footer*>(addr + header->size) };
+				new_f->size = header->size;
+			}
+		}
+
+		uint64_t prev_f_addr{ addr - sizeof(chunk_header) - sizeof(chunk_footer) };
+		if (prev_f_addr <= heap_start) return;
+
+		chunk_footer *prev_f{ reinterpret_cast<chunk_footer*>(prev_f_addr) };
+		uint64_t prev_addr{ prev_f_addr - prev_f->size - sizeof(chunk_header) };
+
+		chunk_header *prev{ reinterpret_cast<chunk_header*>(prev_addr) };
+		if (prev->is_free) {
+			prev->size = prev->size + next_header(header->size) + sizeof(chunk_footer);
+			chunk_footer *new_prev_f{ reinterpret_cast<chunk_footer*>(addr + header->size) };
+			new_prev_f->size = prev->size;
+		}
 	}
 }
 
 extern "C" void kernel_main(uint32_t multiboot_info_addr) {
 	parse_memmap(reinterpret_cast<multiboot_info*>(multiboot_info_addr));
+	init_bitmap();
+	init_heap();
 
 	init_gdt();
 	remap_pic();
@@ -441,7 +599,27 @@ extern "C" void kernel_main(uint32_t multiboot_info_addr) {
 	while (true) {
 		if (!kb_empty()) {
 			const char c{ kb_read() };
-			printCh(c, true);
+			if (c == '\n') {
+				printCh('\n');
+				curr_input[line_len] = '\0';
+				parseCmd();
+
+				for (int i{}; i < 256; ++i) {
+					curr_input[i] = '\0';
+				}
+
+				line_len = 0;
+				print("> ");
+			}
+			else if (c == '\b')
+				printCh('\b');
+			else {
+				if (line_len < 255) {
+					curr_input[line_len++] = c;
+				}
+
+				printCh(c);
+			}
 		}
 
 		__asm__ __volatile__("hlt");
