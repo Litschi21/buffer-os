@@ -10,6 +10,9 @@
 #define INIT_HEAP_FRAMES          1000
 #define MIN_MALLOC_SIZE           40
 #define THREAD_STACK_SIZE         4096
+#define TASK_STATE_READY          0
+#define TASK_STATE_RUNNING        1
+#define TASK_STATE_DEAD           2
 
 volatile char *video{ reinterpret_cast<volatile char*>(0xB8000) };
 int v_pos{};
@@ -130,8 +133,13 @@ static inline uint8_t inb(uint16_t port) {
 	return ret;
 }
 
+void schedule();
 volatile uint64_t timer_ticks{};
-extern "C" void timer_handler() { outb(0x20, 0x20); timer_ticks += 1; }
+extern "C" void timer_handler() {
+	outb(0x20, 0x20);
+	schedule();
+	timer_ticks += 1;
+}
 
 void pit_set_freq(uint32_t freq) {
 	uint32_t div{ 1'193'182 / freq };
@@ -584,9 +592,7 @@ void kfree(const uint64_t addr) {
 }
 
 
-// Kernel-mode Structs & Scheduling
-int next_pid{};
-
+// Scheduling
 struct cpu_context {
     uint64_t rax, rbx, rcx, rdx;
     uint64_t rsi, rdi, rbp;
@@ -603,6 +609,48 @@ struct task_t {
 	struct task_t *next;
 };
 
+int next_pid{};
+task_t *curr_task{ nullptr };
+task_t *task_list_head{ nullptr };
+task_t *idle_task{ nullptr };
+
+void idle_task_func() {
+	while (true)
+		__asm__ __volatile__("hlt");
+}
+
+extern "C" void switch_context(struct cpu_context *old_ctx, struct cpu_context *new_ctx);
+task_t *get_next_task() {
+	if (curr_task && curr_task->next != nullptr)
+		return curr_task->next;
+
+	return task_list_head;
+}
+
+void schedule() {
+	if (!task_list_head) return;
+
+	task_t *old_task{ curr_task };
+	task_t *next_task{ get_next_task() };
+	while (next_task->state == TASK_STATE_DEAD) {
+		curr_task = next_task;
+		next_task = get_next_task();
+
+		if (next_task == old_task && next_task->state == TASK_STATE_DEAD) {
+			next_task = idle_task;
+			break;
+		}
+	}
+
+	curr_task = next_task;
+	switch_context(&(old_task->ctx), &(next_task->ctx));
+}
+
+void task_exit() {
+	curr_task->state = TASK_STATE_DEAD;
+	schedule();
+}
+
 task_t *create_task(void (*entry_point)()) {
 	task_t *task{ reinterpret_cast<task_t*>(kmalloc(sizeof(task_t))) };
 	if (!task) return nullptr;
@@ -615,12 +663,16 @@ task_t *create_task(void (*entry_point)()) {
 	
 	task->stack_top = reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(stack_bot) + THREAD_STACK_SIZE);
 	task->pid = next_pid++;
-	task->state = 0;
+	task->state = TASK_STATE_READY;
 	task->next = nullptr;
 
-	task->ctx.rip = reinterpret_cast<uintptr_t>(entry_point);
-	task->ctx.rsp = reinterpret_cast<uintptr_t>(task->stack_top);
+	uint64_t *stack{ reinterpret_cast<uint64_t*>(task->stack_top) };
 
+	--stack;
+	*stack = reinterpret_cast<uint64_t>(task_exit);
+
+	task->ctx.rip = reinterpret_cast<uintptr_t>(entry_point);
+	task->ctx.rsp = reinterpret_cast<uintptr_t>(stack);
 	task->ctx.rflags = 0x0202;
 
 	task->ctx.rax = 0;
@@ -634,12 +686,30 @@ task_t *create_task(void (*entry_point)()) {
 	return task;
 }
 
-extern "C" void switch_context(struct cpu_context *old_ctx, struct cpu_context *new_ctx);
+void register_task(task_t *task) {
+	if (!task) return;
+
+	if (task_list_head == nullptr) {
+		task_list_head = task;
+		curr_task = task;
+		task->next = task;
+	}
+	else {
+		task_t *tail{ task_list_head };
+		while (tail->next != task_list_head) {
+			tail = tail->next;
+		}
+
+		tail->next = task;
+		task->next = task_list_head;
+	}
+}
 
 extern "C" void kernel_main(uint32_t multiboot_info_addr) {
 	parse_memmap(reinterpret_cast<multiboot_info*>(multiboot_info_addr));
 	init_bitmap();
 	init_heap();
+	idle_task = create_task(idle_task_func);
 
 	init_gdt();
 	remap_pic();
