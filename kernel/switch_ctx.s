@@ -1,11 +1,15 @@
 bits 64
-global switch_context
+global swtch_ctx
+global user_enter
 
 section .text
 
-switch_context:
+user_enter:
+	iretq
+
+swtch_ctx:
 	test rdi, rdi
-    jz .load_new_context
+    jz .load_new_ctx
 
     mov [rdi + 8],  rbx
     mov [rdi + 16], rcx
@@ -23,7 +27,7 @@ switch_context:
     pushfq
     pop qword [rdi + 72]
 
-.load_new_context:
+.load_new_ctx:
     push qword [rsi + 72]
     popfq
 
@@ -36,6 +40,6 @@ switch_context:
     mov rsp, [rsi + 56]
     push qword [rsi + 64]
     
-    mov rsi, [rsi + 32]
     mov rax, [rsi + 0]
+    mov rsi, [rsi + 32]
     ret

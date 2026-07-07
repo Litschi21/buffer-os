@@ -1,18 +1,35 @@
 #include <stdint.h>
 
-#define KB_BUFFER_SIZE            256
-#define GDT_SIZE                  3
+#define GDT_SIZE                  7
 #define IDT_SIZE                  256
+
 #define PIT_FREQ                  200
+
 #define VID_BFR_ROW_LEN           160
-#define MAX_ARG_CNT               16
 #define VID_ROWS                  25
+
+#define KB_BUFFER_SIZE            256
+
+#define MAX_ARG_CNT               16
+
 #define INIT_HEAP_FRAMES          1000
 #define MIN_MALLOC_SIZE           40
+#define MAX_64_BIT_DIG            20
+
 #define THREAD_STACK_SIZE         4096
 #define TASK_STATE_READY          0
 #define TASK_STATE_RUNNING        1
 #define TASK_STATE_DEAD           2
+
+#define PML4_IDX(addr) (((addr) >> 39) & 0x1FF)
+#define PDPT_IDX(addr) (((addr) >> 30) & 0x1FF)
+#define PD_IDX(addr)   (((addr) >> 21) & 0x1FF)
+#define PT_IDX(addr)   (((addr) >> 12) & 0x1FF)
+
+#define PAGE_PRESENT   (1ULL << 0)
+#define PAGE_WRITE     (1ULL << 1)
+#define PAGE_USER      (1ULL << 2)
+#define PAGE_BASE_MASK 0x000FFFFFFFFFF000ULL
 
 volatile char *video{ reinterpret_cast<volatile char*>(0xB8000) };
 int v_pos{};
@@ -32,11 +49,47 @@ struct __attribute__((packed)) gdt_ptr {
 	uint64_t base;
 };
 
+struct __attribute__((packed)) tss_entry {
+    uint32_t reserved0;
+    uint64_t rsp0;
+    uint64_t rsp1;
+    uint64_t rsp2;
+    uint64_t reserved1;
+    uint64_t ist1;
+    uint64_t ist2;
+    uint64_t ist3;
+    uint64_t ist4;
+    uint64_t ist5;
+    uint64_t ist6;
+    uint64_t ist7;
+    uint64_t reserved2;
+    uint16_t reserved3;
+    uint16_t iomap_base;
+};
+
+struct tss_entry tss;
 struct gdt_entry gdt[GDT_SIZE];
 struct gdt_ptr   gdt_ptr;
 
+void gdt_set_tss(int32_t idx, uint64_t base, uint32_t lim) {
+	uint8_t access{ 0x89 };
+	uint8_t flags { 0x00 };
+
+	gdt[idx].lim_low   = (lim & 0xFFFF);
+	gdt[idx].base_low  = (base & 0xFFFF);
+	gdt[idx].base_mid  = (base >> 16) & 0xFF;
+	gdt[idx].base_high = (base >> 24) & 0xFF;
+	
+	gdt[idx].access   = access;
+	gdt[idx].gran     = ((lim >> 16) & 0x0F) | (flags & 0x0F);
+
+	uint32_t *upper_gdt_entry{ reinterpret_cast<uint32_t*>(&gdt[idx + 1]) };
+	upper_gdt_entry[0] = (base >> 32) & 0xFFFFFFFF;
+	upper_gdt_entry[1] = 0;
+}
+
 void gdt_set_gate(int32_t idx, uint32_t base, uint32_t lim, uint8_t access, uint8_t flags) {
-	if (idx >= 3) return;
+	if (idx >= GDT_SIZE) return;
 
 	gdt[idx].base_low  = (base & 0xFFFF);
 	gdt[idx].base_mid  = (base >> 16) & 0xFF;
@@ -44,21 +97,25 @@ void gdt_set_gate(int32_t idx, uint32_t base, uint32_t lim, uint8_t access, uint
 
 	gdt[idx].lim_low   = (lim & 0xFFFF);
 	
-	gdt[idx].gran      = (lim >> 16) & 0x0F;
-	gdt[idx].gran     |= (flags & 0xF0);
 	gdt[idx].access    = access;
+	gdt[idx].gran      = ((lim >> 16) & 0x0F) | (flags & 0xF0);
 }
 
 extern "C" void gdt_flush(uint64_t gdt_ptr_addr);
 void init_gdt() {
-	gdt_ptr.lim  = (sizeof(struct gdt_entry) * 3) - 1;
+	gdt_ptr.lim  = (sizeof(struct gdt_entry) * GDT_SIZE) - 1;
 	gdt_ptr.base = reinterpret_cast<uint64_t>(&gdt);
 
 	gdt_set_gate(0, 0, 0, 0, 0);
 	gdt_set_gate(1, 0, 0xFFFFFFFF, 0x9A, 0xAF);
 	gdt_set_gate(2, 0, 0xFFFFFFFF, 0x92, 0xCF);
 
+	gdt_set_gate(3, 0, 0XFFFFFFFF, 0xFA, 0xAF);
+	gdt_set_gate(4, 0, 0XFFFFFFFF, 0xF2, 0xCF);
+
+	gdt_set_tss(5, reinterpret_cast<uint64_t>(&tss), sizeof(tss_entry) - 1);
 	gdt_flush(reinterpret_cast<uint64_t>(&gdt_ptr));
+	__asm__ __volatile__("ltr %%ax" :: "a"(0x28));
 }
 
 
@@ -101,6 +158,7 @@ static bool vectors[IDT_SIZE];
 extern "C" void *isr_stub_table[];
 extern "C" void timer_isr();
 extern "C" void keyboard_isr();
+extern "C" void handle_page_fault();
 
 void init_idt() {
 	idtr.lim  = static_cast<uint16_t>(sizeof(idt_entry) * IDT_SIZE - 1);
@@ -113,6 +171,7 @@ void init_idt() {
 
 	__asm__ __volatile__ ("lidt %0" : : "m"(idtr));
 	
+	idt_set_descriptor(14, reinterpret_cast<void*>(handle_page_fault), 0x8E);
 	idt_set_descriptor(32, reinterpret_cast<void*>(timer_isr), 0x8E);
 	idt_set_descriptor(33, reinterpret_cast<void*>(keyboard_isr), 0x8E);
 }
@@ -137,8 +196,8 @@ void schedule();
 volatile uint64_t timer_ticks{};
 extern "C" void timer_handler() {
 	outb(0x20, 0x20);
-	schedule();
 	timer_ticks += 1;
+	schedule();
 }
 
 void pit_set_freq(uint32_t freq) {
@@ -196,7 +255,7 @@ extern "C" void keyboard_handler() {
 
 // --- SHELL SECTION ---
 static const char *commands[]{
-	"help", "clear", "echo", "uptime", "ver", "panic"
+	"help", "clear", "echo", "uptime", "ver", "panic", "pagefault"
 };
 
 char curr_input[256]{};
@@ -253,7 +312,7 @@ void print(const char *msg, bool await_input=false, const int color_code=0x0F);
 	print("*** KERNEL PANIC ***\n\n", false, 0x1F);
 	print(msg, false, 0x1F);
 
-	char buf[12];
+	char buf[MAX_64_BIT_DIG];
 	print("\n\nSystem halted at tick ", false, 0x1F);
 	print(to_string(timer_ticks, buf), false, 0x1F);
 	
@@ -265,12 +324,13 @@ void print(const char *msg, bool await_input=false, const int color_code=0x0F);
 void handleCmd(const char *cmd, const char *args[MAX_ARG_CNT]) {
 	if (strEqual(cmd, "help")) {
 		print("This is BufferOS, a small hobby OS designed for Programmers.\n");
-		print("help     Prints all commands along with their descriptions.\n");
-		print("clear    Clears the shell.\n");
-		print("echo     Prints all given arguments.\n");
-		print("uptime   Prints the uptime of the OS in seconds.\n");
-		print("ver      Prints the current version of BufferOS.\n");
-		print("panic    Deliberately causes a Kernel Panic.\n\n");
+		print("help      Prints all commands along with their descriptions.\n");
+		print("clear     Clears the shell.\n");
+		print("echo      Prints all given arguments.\n");
+		print("uptime    Prints the uptime of the OS in seconds.\n");
+		print("ver       Prints the current version of BufferOS.\n");
+		print("panic     Deliberately causes a Kernel Panic.\n");
+		print("pagefault Deliberately activates the Page Fault Handler.\n\n");
 	}
 	else if (strEqual(cmd, "clear")) {
 		for (int i{}; i < v_pos; ++i)
@@ -286,20 +346,20 @@ void handleCmd(const char *cmd, const char *args[MAX_ARG_CNT]) {
 		}
 	}
 	else if (strEqual(cmd, "uptime")) {
-		char buf[12];
-
+		char buf[MAX_64_BIT_DIG];
 		print(to_string(timer_ticks / PIT_FREQ, buf));
 		print("s\n");
 	}
 	else if (strEqual(cmd, "ver"))
 		print("BufferOS Pre-Alpha\n");
-	else if (strEqual(cmd, "panic")) {
+	else if (strEqual(cmd, "panic"))
 		panic("Manually triggered by User.");
-	}
+	else if (strEqual(cmd, "pagefault"))
+		handle_page_fault();
 }
 
 void parseCmd() {
-	const char *args[MAX_ARG_CNT];
+	const char *args[MAX_ARG_CNT]{};
 	char word_buffer[MAX_ARG_CNT][256];
 	uint64_t arg_idx{};
 	uint64_t char_idx{};
@@ -397,6 +457,39 @@ void print(const char *msg, const bool await_input, const int color_code) {
 	}
 }
 
+void shell() {
+	__asm__ __volatile__("sti");
+	print("BufferOS\n", true);
+	while (true) {
+		if (!kb_empty()) {
+			const char c{ kb_read() };
+			if (c == '\n') {
+				printCh('\n');
+				curr_input[line_len] = '\0';
+				parseCmd();
+
+				for (int i{}; i < 256; ++i) {
+					curr_input[i] = '\0';
+				}
+
+				line_len = 0;
+				print("> ");
+			}
+			else if (c == '\b')
+				printCh('\b');
+			else {
+				if (line_len < 255) {
+					curr_input[line_len++] = c;
+				}
+
+				printCh(c);
+			}
+		}
+
+		__asm__ __volatile__("hlt");
+	}
+}
+
 
 // --- MALLOC & FREE SECTION ---
 struct __attribute__((packed)) multiboot_info {
@@ -428,14 +521,14 @@ struct chunk_footer {
 	uint64_t size;
 };
 
-static uint64_t highest_addr{};
+static uint64_t highest_addr;
 static uint64_t total_frames;
 static uint64_t bitmap_size_bytes;
 static uint64_t heap_start;
 static uint64_t heap_end;
 
 extern uint8_t _kernel_end;
-uint8_t* bitmap{ &_kernel_end };
+uint8_t *bitmap{ &_kernel_end };
 
 void parse_memmap(multiboot_info* mbi) {
 	if (!(mbi->flags & (1 << 6)))
@@ -455,7 +548,7 @@ void parse_memmap(multiboot_info* mbi) {
 		addr += entry->size + sizeof(entry->size);
 	}
 
-	total_frames =      highest_addr / 4096;
+	total_frames      = highest_addr / 4096;
 	bitmap_size_bytes = total_frames / 8;
 }
 
@@ -485,37 +578,44 @@ void free_frame(const uint64_t addr) {
 	bitmap[byte_idx] &= ~(1 << bit_idx);
 }
 
-uint64_t next_header(const uint64_t size) { return size + sizeof(chunk_header); }
-void write_footer(const uint64_t header_addr, const uint64_t size) {
-	chunk_footer *f{ reinterpret_cast<chunk_footer*>(size + header_addr + sizeof(chunk_header)) };
+uint64_t next_header(const uint64_t size) { return size + sizeof(chunk_header) + sizeof(chunk_footer); }
+chunk_footer *write_footer(const uint64_t header_addr, const uint64_t size) {
+	const uint64_t f_addr{ header_addr + size + sizeof(chunk_header) };
+	chunk_footer *f{ reinterpret_cast<chunk_footer*>(f_addr) };
 	f->size = size;
+
+	return f;
+}
+
+chunk_header *write_header(const uint64_t addr, const uint64_t size, const bool is_free) {
+	chunk_header *h{ reinterpret_cast<chunk_header*>(addr) };
+	h->size    = size;
+	h->is_free = is_free;
+
+	return h;
 }
 
 void init_bitmap() {
-	for (uint64_t i{}; i < bitmap_size_bytes; ++i) {
+	for (uint64_t i{}; i < bitmap_size_bytes; ++i)
 		bitmap[i] = 0;
-	}
 
 	uint64_t bitmap_end_addr   { reinterpret_cast<uint64_t>(&_kernel_end) + bitmap_size_bytes };
 	uint64_t total_reserved    { (bitmap_end_addr + 4095) / 4096 };
 
-	for (uint64_t frame{}; frame < total_reserved; ++frame) {
+	for (uint64_t frame{}; frame < total_reserved; ++frame)
 		bitmap[frame / 8] |= (1 << (frame % 8));
-	}
 }
 
 void init_heap() {
 	heap_start = alloc_frame();
-	for (int i{}; i < INIT_HEAP_FRAMES - 1; ++i) {
+	for (int i{}; i < INIT_HEAP_FRAMES - 1; ++i)
 		alloc_frame();
-	}
 
 	heap_end = heap_start + INIT_HEAP_FRAMES * 4096;
-	chunk_header *first{ reinterpret_cast<chunk_header*>(heap_start) };
-	first->size = (INIT_HEAP_FRAMES * 4096) - sizeof(chunk_header);
-	first->is_free = true;
 
-	write_footer(heap_start, first->size);
+	const uint64_t size{ (INIT_HEAP_FRAMES * 4096) - sizeof(chunk_header) - sizeof(chunk_footer) };
+	write_header(heap_start, size, true);
+	write_footer(heap_start, size);
 }
 
 uint64_t kmalloc(const uint64_t size) {
@@ -523,7 +623,7 @@ uint64_t kmalloc(const uint64_t size) {
 	while (addr < heap_end) {
 		chunk_header *curr{ reinterpret_cast<chunk_header*>(addr) };
 		if (!curr->is_free) {
-			addr += sizeof(chunk_footer) + next_header(curr->size);
+			addr += next_header(curr->size);
 			continue;
 		}
 
@@ -536,17 +636,14 @@ uint64_t kmalloc(const uint64_t size) {
 				uint64_t new_size{ curr->size - size - sizeof(chunk_header) - sizeof(chunk_footer) };
 				curr->size = size;
 
-				uint64_t new_header_addr{ addr + next_header(curr->size) + sizeof(chunk_footer) };
-				chunk_header *new_header{ reinterpret_cast<chunk_header*>(new_header_addr) };
-				new_header->size = new_size;
-				new_header->is_free = true;
+				uint64_t new_header_addr{ addr + next_header(curr->size) };
+				chunk_header *new_header{ write_header(new_header_addr, new_size, true) };
 
-				uint64_t new_footer_addr{ new_header_addr + next_header(new_header->size) };
-				chunk_footer *new_footer{ reinterpret_cast<chunk_footer*>(new_footer_addr) };
-				new_footer->size = new_size;
+				uint64_t new_footer_addr{ new_header_addr + next_header(new_header->size) - sizeof(chunk_footer) };
+				write_footer(new_footer_addr, new_size);
 
-				chunk_footer *curr_footer{ reinterpret_cast<chunk_footer*>(addr + curr->size + sizeof(chunk_header)) };
-				curr_footer->size = curr->size;
+				uint64_t curr_footer_addr{ addr + curr->size + sizeof(chunk_header) };
+				write_footer(curr_footer_addr, curr->size);
 
 				curr->is_free = false;
 				return addr + sizeof(chunk_header);
@@ -560,45 +657,48 @@ uint64_t kmalloc(const uint64_t size) {
 }
 
 void kfree(const uint64_t addr) {
-	chunk_header *header{ reinterpret_cast<chunk_header*>(addr - sizeof(chunk_header)) };
-	if (header->is_free)
+	chunk_header *curr{ reinterpret_cast<chunk_header*>(addr - sizeof(chunk_header)) };
+	if (curr->is_free)
 		panic("Attempted to double free heap space");
-	else {
-		header->is_free = true;
-		
-		uint64_t next_addr{ addr + header->size + sizeof(chunk_footer) };
-		if (next_addr < heap_end) {
-			chunk_header *next{ reinterpret_cast<chunk_header*>(next_addr) };
-			if (next->is_free) {
-				header->size += next->size + sizeof(chunk_header) + sizeof(chunk_footer);
-				chunk_footer *new_f{ reinterpret_cast<chunk_footer*>(addr + header->size) };
-				new_f->size = header->size;
-			}
+
+	curr->is_free = true;
+	uint64_t next_addr{ addr + next_header(curr->size) };
+	if (next_addr < heap_end) {
+		chunk_header *next{ reinterpret_cast<chunk_header*>(next_addr) };
+		if (next->is_free) {
+			curr->size += next->size + sizeof(chunk_header) + sizeof(chunk_footer);
+			write_footer(addr + curr->size, curr->size);
 		}
+	}
 
-		uint64_t prev_f_addr{ addr - sizeof(chunk_header) - sizeof(chunk_footer) };
-		if (prev_f_addr <= heap_start) return;
+	uint64_t prev_f_addr{ addr - sizeof(chunk_header) - sizeof(chunk_footer) };
+	if (prev_f_addr <= heap_start) return;
 
-		chunk_footer *prev_f{ reinterpret_cast<chunk_footer*>(prev_f_addr) };
-		uint64_t prev_addr{ prev_f_addr - prev_f->size - sizeof(chunk_header) };
+	chunk_footer *prev_f{ reinterpret_cast<chunk_footer*>(prev_f_addr) };
+	uint64_t prev_addr{ prev_f_addr - prev_f->size - sizeof(chunk_header) };
 
-		chunk_header *prev{ reinterpret_cast<chunk_header*>(prev_addr) };
-		if (prev->is_free) {
-			prev->size = prev->size + next_header(header->size) + sizeof(chunk_footer);
-			chunk_footer *new_prev_f{ reinterpret_cast<chunk_footer*>(addr + header->size) };
-			new_prev_f->size = prev->size;
-		}
+	chunk_header *prev{ reinterpret_cast<chunk_header*>(prev_addr) };
+	if (prev->is_free) {
+		prev->size += curr->size + sizeof(chunk_header) + sizeof(chunk_footer);
+		write_footer(addr + curr->size, prev->size);
 	}
 }
 
 
+extern "C" void user_enter();
+
 // Scheduling
 struct cpu_context {
-    uint64_t rax, rbx, rcx, rdx;
-    uint64_t rsi, rdi, rbp;
-    uint64_t rsp;
-    uint64_t rip;
-    uint64_t rflags;
+	uint64_t rax;
+	uint64_t rbx;
+	uint64_t rcx;
+	uint64_t rdx;
+	uint64_t rsi;
+	uint64_t rdi;
+	uint64_t rbp;
+	uint64_t rsp;
+	uint64_t rip;
+	uint64_t rflags;
 };
 
 struct task_t {
@@ -610,18 +710,20 @@ struct task_t {
 };
 
 int next_pid{};
-task_t *curr_task{ nullptr };
-task_t *task_list_head{ nullptr };
-task_t *idle_task{ nullptr };
+task_t *curr_task{};
+task_t *task_list_head{};
+task_t *task_list_tail{};
+task_t *idle_task{};
 
 void idle_task_func() {
+	__asm__ __volatile__("sti");
 	while (true)
 		__asm__ __volatile__("hlt");
 }
 
-extern "C" void switch_context(struct cpu_context *old_ctx, struct cpu_context *new_ctx);
+extern "C" void swtch_ctx(struct cpu_context *old_ctx, struct cpu_context *new_ctx);
 task_t *get_next_task() {
-	if (curr_task && curr_task->next != nullptr)
+	if (curr_task && curr_task->next)
 		return curr_task->next;
 
 	return task_list_head;
@@ -643,7 +745,20 @@ void schedule() {
 	}
 
 	curr_task = next_task;
-	switch_context(&(old_task->ctx), &(next_task->ctx));
+	uint64_t stack_top{ reinterpret_cast<uint64_t>(next_task->stack_top) + THREAD_STACK_SIZE };
+	tss.rsp0 = stack_top;
+
+	if (!old_task) {
+		swtch_ctx(nullptr, &(next_task->ctx));
+	}
+	else {
+		if (old_task->state == TASK_STATE_RUNNING)
+			old_task->state = TASK_STATE_READY;
+
+		swtch_ctx(&(old_task->ctx), &(next_task->ctx));
+	}
+
+	__asm__ __volatile__("sti");
 }
 
 void task_exit() {
@@ -651,7 +766,9 @@ void task_exit() {
 	schedule();
 }
 
-task_t *create_task(void (*entry_point)()) {
+
+void map_page(uint64_t *pml4_virt, uint64_t virt_addr, uint64_t phys_addr, uint64_t flags);
+task_t *create_task(void (*entry_point)(), const bool kernel=false) {
 	task_t *task{ reinterpret_cast<task_t*>(kmalloc(sizeof(task_t))) };
 	if (!task) return nullptr;
 
@@ -660,28 +777,49 @@ task_t *create_task(void (*entry_point)()) {
 		kfree(reinterpret_cast<uint64_t>(task));
 		return nullptr;
 	}
-	
-	task->stack_top = reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(stack_bot) + THREAD_STACK_SIZE);
+
 	task->pid = next_pid++;
 	task->state = TASK_STATE_READY;
 	task->next = nullptr;
-
-	uint64_t *stack{ reinterpret_cast<uint64_t*>(task->stack_top) };
-
-	--stack;
-	*stack = reinterpret_cast<uint64_t>(task_exit);
-
-	task->ctx.rip = reinterpret_cast<uintptr_t>(entry_point);
-	task->ctx.rsp = reinterpret_cast<uintptr_t>(stack);
-	task->ctx.rflags = 0x0202;
+	task->stack_top = stack_bot;
 
 	task->ctx.rax = 0;
-    task->ctx.rbx = 0;
-    task->ctx.rcx = 0;
-    task->ctx.rdx = 0;
-    task->ctx.rsi = 0;
-    task->ctx.rdi = 0;
-    task->ctx.rbp = reinterpret_cast<uintptr_t>(task->stack_top);
+	task->ctx.rbx = 0;
+	task->ctx.rcx = 0;
+	task->ctx.rdx = 0;
+	task->ctx.rsi = 0;
+	task->ctx.rdi = 0;
+	task->ctx.rbp = 0;
+	task->ctx.rflags = 0;
+
+	if (kernel) {
+		uint64_t *stack_ptr{ reinterpret_cast<uint64_t*>(reinterpret_cast<uintptr_t>(stack_bot) + THREAD_STACK_SIZE) };
+		*(--stack_ptr) = 0;
+
+		task->ctx.rsp = reinterpret_cast<uint64_t>(stack_ptr);
+		task->ctx.rip = reinterpret_cast<uint64_t>(entry_point);
+	} else {
+		uint64_t *pml4;
+		__asm__ __volatile__("mov %%cr3, %0" : "=r"(pml4));
+
+		uint64_t user_stack_phys{ alloc_frame() };
+		uint64_t user_stack_virt{ 0x00007FFFFFFFE000 };
+		map_page(pml4, user_stack_virt, user_stack_phys, PAGE_PRESENT | PAGE_WRITE | PAGE_USER);
+
+		uint64_t phys_entry{ reinterpret_cast<uint64_t>(entry_point) };
+		map_page(pml4, phys_entry, phys_entry, PAGE_PRESENT | PAGE_WRITE | PAGE_USER);
+
+		uint64_t *stack_ptr{ reinterpret_cast<uint64_t*>(reinterpret_cast<uintptr_t>(stack_bot) + THREAD_STACK_SIZE) };
+		*(--stack_ptr) = 0x23;
+		*(--stack_ptr) = user_stack_virt + 4096;
+		*(--stack_ptr) = 0x202;
+		*(--stack_ptr) = 0x1B;
+		*(--stack_ptr) = reinterpret_cast<uint64_t>(entry_point);
+
+		task->ctx.rsp = reinterpret_cast<uint64_t>(stack_ptr);
+		task->ctx.rip = reinterpret_cast<uint64_t>(user_enter);
+		task->ctx.rflags = 0x202;
+	}
 
 	return task;
 }
@@ -691,59 +829,98 @@ void register_task(task_t *task) {
 
 	if (task_list_head == nullptr) {
 		task_list_head = task;
+		task_list_tail = task;
 		curr_task = task;
 		task->next = task;
 	}
 	else {
-		task_t *tail{ task_list_head };
-		while (tail->next != task_list_head) {
-			tail = tail->next;
-		}
-
-		tail->next = task;
+		task_list_tail->next = task;
 		task->next = task_list_head;
+		task_list_tail = task;
 	}
+}
+
+
+// Paging
+extern "C" void handle_page_fault() {
+	__asm__ __volatile__("cli");
+
+	uint64_t faulty_addr;
+	__asm__ __volatile__("mov %%cr2, %0" : "=r"(faulty_addr));
+	for (int i{}; i < VID_BFR_ROW_LEN * VID_ROWS; i += 2) {
+		video[i]      = ' ';
+		video[i + 1]  = 0x4F;
+	}
+
+	v_pos = 0;
+	print("*** PAGE FAULT ***\n\n", false, 0x4F);
+	print("CPU attempted access of a non-mapped or non-permitted memory page.\n", false, 0x4F);
+
+	char buf[20];
+	print("Faulty Address: 0x", false, 0x4F);
+	print(to_string(faulty_addr, buf), false, 0x4F);
+	printCh('\n', false, 0x4F);
+
+	while (true) { __asm__ __volatile__("hlt"); }
+}
+
+uint64_t create_page() {
+	uint64_t phys_table{ alloc_frame() };
+	uint64_t *virt_table{ reinterpret_cast<uint64_t*>(phys_table) };
+	for (int i{}; i < 512; ++i) virt_table[i] = 0;
+
+	return phys_table;
+}
+
+bool check_subtable(const uint64_t *virt, const uint64_t idx) { return !(virt[idx] & PAGE_PRESENT); }
+inline uint64_t create_bitmasks() { return create_page() | PAGE_PRESENT | PAGE_WRITE | PAGE_USER; }
+uint64_t *create_pt_entry(const uint64_t *virt, const uint64_t idx) {
+	return reinterpret_cast<uint64_t*>(virt[idx] & PAGE_BASE_MASK);
+}
+
+void map_page(uint64_t *pml4_virt, uint64_t virt_addr, uint64_t phys_addr, uint64_t flags) {
+	flags |= PAGE_PRESENT;
+
+	uint64_t pml4_idx{ PML4_IDX(virt_addr) };
+	if (check_subtable(pml4_virt, pml4_idx))
+		pml4_virt[pml4_idx] = create_bitmasks();
+
+	uint64_t *pdpt{ create_pt_entry(pml4_virt, pml4_idx) };
+	uint64_t pdpt_idx{ PDPT_IDX(virt_addr) };
+    if (check_subtable(pdpt, pdpt_idx))
+		pdpt[pdpt_idx] = create_bitmasks();
+
+	uint64_t *pd{ create_pt_entry(pdpt, pdpt_idx) };
+	uint64_t pd_idx = PD_IDX(virt_addr);
+    if (check_subtable(pd, pd_idx))
+		pd[pd_idx] = create_bitmasks();
+
+	uint64_t *pt{ create_pt_entry(pd, pd_idx) };
+	uint64_t pt_idx{ PT_IDX(virt_addr) };
+    pt[pt_idx] = (phys_addr & PAGE_BASE_MASK) | flags;
+
+	__asm__ __volatile__("invlpg (%0)" :: "r"(virt_addr) : "memory");
 }
 
 extern "C" void kernel_main(uint32_t multiboot_info_addr) {
 	parse_memmap(reinterpret_cast<multiboot_info*>(multiboot_info_addr));
 	init_bitmap();
 	init_heap();
-	idle_task = create_task(idle_task_func);
+
+	idle_task = create_task(idle_task_func, true);
+	register_task(idle_task);
+	
+	task_t *shell_task{ create_task(shell, true) };
+	register_task(shell_task);
 
 	init_gdt();
 	remap_pic();
 	init_idt();
+
 	pit_set_freq(PIT_FREQ);
 	__asm__ __volatile__ ("sti");
 
-	print("BufferOS\n", true);
 	while (true) {
-		if (!kb_empty()) {
-			const char c{ kb_read() };
-			if (c == '\n') {
-				printCh('\n');
-				curr_input[line_len] = '\0';
-				parseCmd();
-
-				for (int i{}; i < 256; ++i) {
-					curr_input[i] = '\0';
-				}
-
-				line_len = 0;
-				print("> ");
-			}
-			else if (c == '\b')
-				printCh('\b');
-			else {
-				if (line_len < 255) {
-					curr_input[line_len++] = c;
-				}
-
-				printCh(c);
-			}
-		}
-
 		__asm__ __volatile__("hlt");
 	}
 }
