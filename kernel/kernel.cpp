@@ -1,6 +1,6 @@
 #include <stdint.h>
 
-#define GDT_SIZE                  7
+#define GDT_SIZE                  9
 #define IDT_SIZE                  256
 
 #define PIT_FREQ                  200
@@ -113,9 +113,11 @@ void init_gdt() {
 	gdt_set_gate(3, 0, 0XFFFFFFFF, 0xFA, 0xAF);
 	gdt_set_gate(4, 0, 0XFFFFFFFF, 0xF2, 0xCF);
 
-	gdt_set_tss(5, reinterpret_cast<uint64_t>(&tss), sizeof(tss_entry) - 1);
+	gdt_set_gate(5, 0, 0xFFFFFFFF, 0xFA, 0xAF);
+
+	gdt_set_tss(6, reinterpret_cast<uint64_t>(&tss), sizeof(tss_entry) - 1);
 	gdt_flush(reinterpret_cast<uint64_t>(&gdt_ptr));
-	__asm__ __volatile__("ltr %%ax" :: "a"(0x28));
+	__asm__ __volatile__("ltr %%ax" :: "a"(0x30));
 }
 
 
@@ -709,6 +711,12 @@ struct task_t {
 	struct task_t *next;
 };
 
+// From Syscalls
+struct cpu_data {
+	uint64_t user_rsp;
+	uint64_t kernel_rsp;
+} cpu_data;
+
 int next_pid{};
 task_t *curr_task{};
 task_t *task_list_head{};
@@ -746,6 +754,7 @@ void schedule() {
 
 	curr_task = next_task;
 	uint64_t stack_top{ reinterpret_cast<uint64_t>(next_task->stack_top) + THREAD_STACK_SIZE };
+	cpu_data.kernel_rsp = stack_top;
 	tss.rsp0 = stack_top;
 
 	if (!old_task) {
@@ -878,28 +887,84 @@ uint64_t *create_pt_entry(const uint64_t *virt, const uint64_t idx) {
 	return reinterpret_cast<uint64_t*>(virt[idx] & PAGE_BASE_MASK);
 }
 
+void subtable_bitmask_check(uint64_t *pt, const uint64_t idx) {
+	if (check_subtable(pt, idx))
+		pt[idx] = create_bitmasks();
+}
+
 void map_page(uint64_t *pml4_virt, uint64_t virt_addr, uint64_t phys_addr, uint64_t flags) {
 	flags |= PAGE_PRESENT;
 
 	uint64_t pml4_idx{ PML4_IDX(virt_addr) };
-	if (check_subtable(pml4_virt, pml4_idx))
-		pml4_virt[pml4_idx] = create_bitmasks();
+	subtable_bitmask_check(pml4_virt, pml4_idx);
 
 	uint64_t *pdpt{ create_pt_entry(pml4_virt, pml4_idx) };
 	uint64_t pdpt_idx{ PDPT_IDX(virt_addr) };
-    if (check_subtable(pdpt, pdpt_idx))
-		pdpt[pdpt_idx] = create_bitmasks();
+	subtable_bitmask_check(pdpt, pdpt_idx);
 
 	uint64_t *pd{ create_pt_entry(pdpt, pdpt_idx) };
 	uint64_t pd_idx = PD_IDX(virt_addr);
-    if (check_subtable(pd, pd_idx))
-		pd[pd_idx] = create_bitmasks();
+	subtable_bitmask_check(pd, pd_idx);
 
 	uint64_t *pt{ create_pt_entry(pd, pd_idx) };
 	uint64_t pt_idx{ PT_IDX(virt_addr) };
     pt[pt_idx] = (phys_addr & PAGE_BASE_MASK) | flags;
 
 	__asm__ __volatile__("invlpg (%0)" :: "r"(virt_addr) : "memory");
+}
+
+
+// --- SYSCALLS SECTION ---
+struct syscall_frame {
+	uint64_t r15, r14, r13, r12, r11, r10, r9, r8;
+	uint64_t rdx, rcx, rbx, rax;
+	uint64_t rbp;
+	uint64_t rdi;
+	uint64_t rsi;
+};
+
+enum class SYS {
+	exit = 0,
+	write,
+	sleep,
+	getpid,
+	uptime
+};
+
+extern "C" uint64_t handle_syscall(struct syscall_frame *f) {
+	switch (static_cast<SYS>(f->rax)) {
+	case SYS::exit:
+		task_exit();
+		break;
+	case SYS::write:
+		print(reinterpret_cast<const char*>(f->rsi));
+		break;
+	case SYS::sleep:
+		sleep(f->rdi);
+		break;
+	case SYS::getpid:
+		return curr_task->pid;
+	case SYS::uptime:
+		return timer_ticks;
+	default:
+		return -1;
+	}
+
+	return 0;
+}
+
+static void write_msr(uint32_t msr, uint64_t val) {
+	uint32_t low { static_cast<uint32_t>(val & 0xFFFFFFFF) };
+	uint32_t high{ static_cast<uint32_t>((val >> 32) & 0xFFFFFFFF) };
+	__asm__ __volatile__("wrmsr" : : "c"(msr), "a"(low), "d"(high));
+}
+
+extern "C" void syscall_entry();
+void init_syscalls() {
+	write_msr(0xC0000081, (static_cast<uint64_t>(0x18) << 32) | static_cast<uint64_t>(0x08));
+	write_msr(0xC0000082, reinterpret_cast<uint64_t>(syscall_entry));
+	write_msr(0xC0000084, 0x200);
+	write_msr(0xC0000102, reinterpret_cast<uint64_t>(&cpu_data));
 }
 
 extern "C" void kernel_main(uint32_t multiboot_info_addr) {
@@ -914,6 +979,7 @@ extern "C" void kernel_main(uint32_t multiboot_info_addr) {
 	register_task(shell_task);
 
 	init_gdt();
+	init_syscalls();
 	remap_pic();
 	init_idt();
 
