@@ -1,71 +1,9 @@
+#include "elf.h"
+#include "kernel.h"
 #include <stdint.h>
-
-#define GDT_SIZE                  9
-#define IDT_SIZE                  256
-
-#define PIT_FREQ                  200
-
-#define VID_BFR_ROW_LEN           160
-#define VID_ROWS                  25
-
-#define KB_BUFFER_SIZE            256
-
-#define MAX_ARG_CNT               16
-
-#define INIT_HEAP_FRAMES          1000
-#define MIN_MALLOC_SIZE           40
-#define MAX_64_BIT_DIG            20
-
-#define THREAD_STACK_SIZE         4096
-#define TASK_STATE_READY          0
-#define TASK_STATE_RUNNING        1
-#define TASK_STATE_DEAD           2
-
-#define PML4_IDX(addr) (((addr) >> 39) & 0x1FF)
-#define PDPT_IDX(addr) (((addr) >> 30) & 0x1FF)
-#define PD_IDX(addr)   (((addr) >> 21) & 0x1FF)
-#define PT_IDX(addr)   (((addr) >> 12) & 0x1FF)
-
-#define PAGE_PRESENT   (1ULL << 0)
-#define PAGE_WRITE     (1ULL << 1)
-#define PAGE_USER      (1ULL << 2)
-#define PAGE_BASE_MASK 0x000FFFFFFFFFF000ULL
 
 volatile char *video{ reinterpret_cast<volatile char*>(0xB8000) };
 int v_pos{};
-
-// --- GDT SECTION ---
-struct __attribute__((packed)) gdt_entry {
-	uint16_t lim_low;
-	uint16_t base_low;
-	uint8_t  base_mid;
-	uint8_t  access;
-	uint8_t  gran;
-	uint8_t  base_high;
-};
-
-struct __attribute__((packed)) gdt_ptr {
-	uint16_t lim;
-	uint64_t base;
-};
-
-struct __attribute__((packed)) tss_entry {
-    uint32_t reserved0;
-    uint64_t rsp0;
-    uint64_t rsp1;
-    uint64_t rsp2;
-    uint64_t reserved1;
-    uint64_t ist1;
-    uint64_t ist2;
-    uint64_t ist3;
-    uint64_t ist4;
-    uint64_t ist5;
-    uint64_t ist6;
-    uint64_t ist7;
-    uint64_t reserved2;
-    uint16_t reserved3;
-    uint16_t iomap_base;
-};
 
 struct tss_entry tss;
 struct gdt_entry gdt[GDT_SIZE];
@@ -101,7 +39,6 @@ void gdt_set_gate(int32_t idx, uint32_t base, uint32_t lim, uint8_t access, uint
 	gdt[idx].gran      = ((lim >> 16) & 0x0F) | (flags & 0xF0);
 }
 
-extern "C" void gdt_flush(uint64_t gdt_ptr_addr);
 void init_gdt() {
 	gdt_ptr.lim  = (sizeof(struct gdt_entry) * GDT_SIZE) - 1;
 	gdt_ptr.base = reinterpret_cast<uint64_t>(&gdt);
@@ -122,21 +59,7 @@ void init_gdt() {
 
 
 // --- IDT SECTION ---
-struct __attribute__((packed)) idt_entry {
-	uint16_t isr_low;
-	uint16_t kernel_cs;
-	uint8_t  ist;
-	uint8_t  attributes;
-	uint16_t isr_mid;
-	uint32_t isr_high;
-	uint32_t reserved;
-};
-
-struct __attribute__((packed)) idtr_t {
-	uint16_t lim;
-	uint64_t base;
-};
-
+static bool      vectors[IDT_SIZE];
 static idt_entry idt[IDT_SIZE];
 static idtr_t    idtr;
 
@@ -156,12 +79,6 @@ void idt_set_descriptor(uint8_t v, void *isr, uint8_t flags) {
 	descriptor->reserved   = 0;
 }
 
-static bool vectors[IDT_SIZE];
-extern "C" void *isr_stub_table[];
-extern "C" void timer_isr();
-extern "C" void keyboard_isr();
-extern "C" void handle_page_fault();
-
 void init_idt() {
 	idtr.lim  = static_cast<uint16_t>(sizeof(idt_entry) * IDT_SIZE - 1);
 	idtr.base = reinterpret_cast<uintptr_t>(&idt[0]);
@@ -179,10 +96,6 @@ void init_idt() {
 }
 
 
-// --- PIC SECTION ---
-extern "C" void remap_pic();
-
-
 // --- TIMER & KB SECTION ---
 static inline void outb(uint16_t port, uint8_t val) {
 	__asm__ __volatile__ ("outb %0, %1" : : "a"(val), "Nd"(port));
@@ -194,7 +107,6 @@ static inline uint8_t inb(uint16_t port) {
 	return ret;
 }
 
-void schedule();
 volatile uint64_t timer_ticks{};
 extern "C" void timer_handler() {
 	outb(0x20, 0x20);
@@ -216,7 +128,7 @@ void sleep(uint64_t ms) {
 		__asm__ __volatile__("hlt");
 }
 
-static const char scancode_ascii[128]{
+static const char scancode_ascii[128] {
 	0,  27, '1','2','3','4','5','6','7','8','9','0','-','=','\b',
     '\t','q','w','e','r','t','y','u','i','o','p','[',']','\n',
     0, 'a','s','d','f','g','h','j','k','l',';','\'','`',
@@ -300,9 +212,7 @@ char *to_string(int64_t n, char *buf) {
 	return buf;
 }
 
-void printCh(char c, bool await_input=false, const int color_code=0x0F);
-void print(const char *msg, bool await_input=false, const int color_code=0x0F);
-[[noreturn]] void panic(const char *msg) {
+void panic(const char *msg) {
 	__asm__ __volatile__("cli");
 
 	for (int i{}; i < VID_BFR_ROW_LEN * 25; i += 2) {
@@ -494,35 +404,6 @@ void shell() {
 
 
 // --- MALLOC & FREE SECTION ---
-struct __attribute__((packed)) multiboot_info {
-    uint32_t flags;
-    uint32_t mem_lower;
-    uint32_t mem_upper;
-    uint32_t boot_device;
-    uint32_t cmdline;
-    uint32_t mods_count;
-    uint32_t mods_addr;
-    uint32_t syms[4];
-    uint32_t mmap_length;
-    uint32_t mmap_addr;
-};
-
-struct __attribute__((packed)) mmap_entry {
-    uint32_t size;
-	uint64_t addr;
-    uint64_t len;
-    uint32_t type;
-};
-
-struct chunk_header {
-	uint64_t size;
-	bool     is_free;
-};
-
-struct chunk_footer {
-	uint64_t size;
-};
-
 static uint64_t highest_addr;
 static uint64_t total_frames;
 static uint64_t bitmap_size_bytes;
@@ -686,37 +567,16 @@ void kfree(const uint64_t addr) {
 	}
 }
 
+void memcpy(void *dest, const void *src, const uint64_t n) {
+	for (uint64_t i{}; i < n; ++i)
+		reinterpret_cast<volatile uint8_t*>(dest)[i] = reinterpret_cast<const uint8_t*>(src)[i];
+}
 
-extern "C" void user_enter();
-
-// Scheduling
-struct cpu_context {
-	uint64_t rax;
-	uint64_t rbx;
-	uint64_t rcx;
-	uint64_t rdx;
-	uint64_t rsi;
-	uint64_t rdi;
-	uint64_t rbp;
-	uint64_t rsp;
-	uint64_t rip;
-	uint64_t rflags;
-};
-
-struct task_t {
-	int pid;
-	uint8_t state;
-	void *stack_top;
-	struct cpu_context ctx;
-	struct task_t *next;
-};
 
 // From Syscalls
-struct cpu_data {
-	uint64_t user_rsp;
-	uint64_t kernel_rsp;
-} cpu_data;
+struct cpu_data cpu_data;
 
+// Scheduling
 int next_pid{};
 task_t *curr_task{};
 task_t *task_list_head{};
@@ -729,7 +589,6 @@ void idle_task_func() {
 		__asm__ __volatile__("hlt");
 }
 
-extern "C" void swtch_ctx(struct cpu_context *old_ctx, struct cpu_context *new_ctx);
 task_t *get_next_task() {
 	if (curr_task && curr_task->next)
 		return curr_task->next;
@@ -775,18 +634,13 @@ void task_exit() {
 	schedule();
 }
 
+uint64_t *get_pml4() {
+	uint64_t *pml4;
+	__asm__ __volatile__("mov %%cr3, %0" : "=r"(pml4));
+	return pml4;
+}
 
-void map_page(uint64_t *pml4_virt, uint64_t virt_addr, uint64_t phys_addr, uint64_t flags);
-task_t *create_task(void (*entry_point)(), const bool kernel=false) {
-	task_t *task{ reinterpret_cast<task_t*>(kmalloc(sizeof(task_t))) };
-	if (!task) return nullptr;
-
-	void *stack_bot{ reinterpret_cast<void*>(kmalloc(THREAD_STACK_SIZE)) };
-	if (!stack_bot) {
-		kfree(reinterpret_cast<uint64_t>(task));
-		return nullptr;
-	}
-
+void set_task_vals(task_t *task, void *stack_bot) {
 	task->pid = next_pid++;
 	task->state = TASK_STATE_READY;
 	task->next = nullptr;
@@ -800,34 +654,51 @@ task_t *create_task(void (*entry_point)(), const bool kernel=false) {
 	task->ctx.rdi = 0;
 	task->ctx.rbp = 0;
 	task->ctx.rflags = 0;
+}
 
-	if (kernel) {
+void push_stack_vals(uint64_t *stack_ptr, uint64_t user_stack_virt, void (*entry_point)()) {
+	*(--stack_ptr) = 0x23;
+	*(--stack_ptr) = user_stack_virt + 4096;
+	*(--stack_ptr) = 0x202;
+	*(--stack_ptr) = 0x1B;
+	*(--stack_ptr) = reinterpret_cast<uint64_t>(entry_point);
+}
+
+void set_ctx_regs(task_t *task, uint64_t *stack_ptr) {
+	task->ctx.rsp = reinterpret_cast<uint64_t>(stack_ptr);
+	task->ctx.rip = reinterpret_cast<uint64_t>(user_enter);
+	task->ctx.rflags = 0x202;
+};
+
+task_t *create_task(void (*entry_point)(), const bool is_kernel) {
+	task_t *task{ reinterpret_cast<task_t*>(kmalloc(sizeof(task_t))) };
+	if (!task) return nullptr;
+
+	void *stack_bot{ reinterpret_cast<void*>(kmalloc(THREAD_STACK_SIZE)) };
+	if (!stack_bot) {
+		kfree(reinterpret_cast<uint64_t>(task));
+		return nullptr;
+	}
+
+	set_task_vals(task, stack_bot);
+
+	if (is_kernel) {
 		uint64_t *stack_ptr{ reinterpret_cast<uint64_t*>(reinterpret_cast<uintptr_t>(stack_bot) + THREAD_STACK_SIZE) };
 		*(--stack_ptr) = 0;
 
 		task->ctx.rsp = reinterpret_cast<uint64_t>(stack_ptr);
 		task->ctx.rip = reinterpret_cast<uint64_t>(entry_point);
 	} else {
-		uint64_t *pml4;
-		__asm__ __volatile__("mov %%cr3, %0" : "=r"(pml4));
-
-		uint64_t user_stack_phys{ alloc_frame() };
+		uint64_t *pml4{ get_pml4() };
 		uint64_t user_stack_virt{ 0x00007FFFFFFFE000 };
-		map_page(pml4, user_stack_virt, user_stack_phys, PAGE_PRESENT | PAGE_WRITE | PAGE_USER);
+		map_page(pml4, user_stack_virt, alloc_frame(), PAGE_PRESENT | PAGE_WRITE | PAGE_USER);
 
 		uint64_t phys_entry{ reinterpret_cast<uint64_t>(entry_point) };
 		map_page(pml4, phys_entry, phys_entry, PAGE_PRESENT | PAGE_WRITE | PAGE_USER);
 
 		uint64_t *stack_ptr{ reinterpret_cast<uint64_t*>(reinterpret_cast<uintptr_t>(stack_bot) + THREAD_STACK_SIZE) };
-		*(--stack_ptr) = 0x23;
-		*(--stack_ptr) = user_stack_virt + 4096;
-		*(--stack_ptr) = 0x202;
-		*(--stack_ptr) = 0x1B;
-		*(--stack_ptr) = reinterpret_cast<uint64_t>(entry_point);
-
-		task->ctx.rsp = reinterpret_cast<uint64_t>(stack_ptr);
-		task->ctx.rip = reinterpret_cast<uint64_t>(user_enter);
-		task->ctx.rflags = 0x202;
+		push_stack_vals(stack_ptr, user_stack_virt, entry_point);
+		set_ctx_regs(task, stack_ptr);
 	}
 
 	return task;
@@ -915,30 +786,19 @@ void map_page(uint64_t *pml4_virt, uint64_t virt_addr, uint64_t phys_addr, uint6
 
 
 // --- SYSCALLS SECTION ---
-struct syscall_frame {
-	uint64_t r15, r14, r13, r12, r11, r10, r9, r8;
-	uint64_t rdx, rcx, rbx, rax;
-	uint64_t rbp;
-	uint64_t rdi;
-	uint64_t rsi;
-};
-
-enum class SYS {
-	exit = 0,
-	write,
-	sleep,
-	getpid,
-	uptime
-};
-
 extern "C" uint64_t handle_syscall(struct syscall_frame *f) {
 	switch (static_cast<SYS>(f->rax)) {
 	case SYS::exit:
 		task_exit();
 		break;
 	case SYS::write:
-		print(reinterpret_cast<const char*>(f->rsi));
+		print(reinterpret_cast<const char*>(f->rdi));
 		break;
+	case SYS::exec: {
+		task_t *t{ create_elf_task(reinterpret_cast<void*>(f->rdi)) };
+		if (t) register_task(t);
+		return t ? t->pid : -1;
+	}
 	case SYS::sleep:
 		sleep(f->rdi);
 		break;
@@ -959,7 +819,6 @@ static void write_msr(uint32_t msr, uint64_t val) {
 	__asm__ __volatile__("wrmsr" : : "c"(msr), "a"(low), "d"(high));
 }
 
-extern "C" void syscall_entry();
 void init_syscalls() {
 	write_msr(0xC0000081, (static_cast<uint64_t>(0x18) << 32) | static_cast<uint64_t>(0x08));
 	write_msr(0xC0000082, reinterpret_cast<uint64_t>(syscall_entry));
