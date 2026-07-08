@@ -1,6 +1,6 @@
 #pragma once
 
-#include "kernel.h"
+#include "kernel.hpp"
 #include <stdint.h>
 
 struct __attribute__((packed)) Ehdr {

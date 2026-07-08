@@ -112,6 +112,11 @@ extern "C" void remap_pic();
 // --- TIMER & KB SECTION ---
 extern volatile uint64_t timer_ticks;
 
+void outb(uint16_t port, uint8_t val);
+uint8_t inb(uint16_t port);
+void outw(uint16_t port, uint16_t val);
+uint16_t inw(uint16_t port);
+
 extern "C" void timer_handler();
 void pit_set_freq(uint32_t freq);
 void sleep(uint64_t ms);

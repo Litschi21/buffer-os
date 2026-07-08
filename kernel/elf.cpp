@@ -1,5 +1,5 @@
-#include "elf.h"
-#include "kernel.h"
+#include "elf.hpp"
+#include "kernel.hpp"
 #include <stdint.h>
 
 uint64_t load_elf(void *base, uint64_t *out_top) {
