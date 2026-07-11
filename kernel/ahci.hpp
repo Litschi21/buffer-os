@@ -31,7 +31,7 @@ struct FIS_REG_H2D {
 					    // Isochronous is a fire name for a dino, like a velociraptor-looking one
 	uint8_t control;    // Control register
 
-	uint8_t  rsv1[4];   // Reserved
+	uint8_t rsv1[4];    // Reserved
 };
 
 struct HBA_CMD_HDR {
@@ -118,4 +118,7 @@ struct HBA_MEM {
 	HBA_PORT ports[1];          // port ctl regs
 };
 
-void ahci_init(uint32_t bar5);
+extern HBA_CMD_TBL *cmdtbl;
+
+void ahci_init (uint32_t bar5);
+bool ahci_do (uint8_t drive, uint64_t lba, void *buf, uint64_t count, bool write);
