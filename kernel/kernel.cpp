@@ -1,3 +1,4 @@
+#include "ahci.hpp"
 #include "elf.hpp"
 #include "kernel.hpp"
 #include <stdint.h>
@@ -13,8 +14,8 @@ void gdt_set_tss(int32_t idx, uint64_t base, uint32_t lim) {
 	uint8_t access{ 0x89 };
 	uint8_t flags { 0x00 };
 
-	gdt[idx].lim_low   = (lim & 0xFFFF);
-	gdt[idx].base_low  = (base & 0xFFFF);
+	gdt[idx].lim_low   = lim  & 0xFFFF;
+	gdt[idx].base_low  = base & 0xFFF;
 	gdt[idx].base_mid  = (base >> 16) & 0xFF;
 	gdt[idx].base_high = (base >> 24) & 0xFF;
 	
@@ -22,7 +23,7 @@ void gdt_set_tss(int32_t idx, uint64_t base, uint32_t lim) {
 	gdt[idx].gran     = ((lim >> 16) & 0x0F) | (flags & 0x0F);
 
 	uint32_t *upper_gdt_entry{ reinterpret_cast<uint32_t*>(&gdt[idx + 1]) };
-	upper_gdt_entry[0] = (base >> 32) & 0xFFFFFFFF;
+	upper_gdt_entry[0] = base >> 32;
 	upper_gdt_entry[1] = 0;
 }
 
@@ -44,17 +45,17 @@ void init_gdt() {
 	gdt_ptr.base = reinterpret_cast<uint64_t>(&gdt);
 
 	gdt_set_gate(0, 0, 0, 0, 0);
-	gdt_set_gate(1, 0, 0xFFFFFFFF, 0x9A, 0xAF);
-	gdt_set_gate(2, 0, 0xFFFFFFFF, 0x92, 0xCF);
+	gdt_set_gate(1, 0, 0xFFFFFFFF, 0x9A, CODE_SEG);
+	gdt_set_gate(2, 0, 0xFFFFFFFF, 0x92, DATA_SEG);
 
-	gdt_set_gate(3, 0, 0XFFFFFFFF, 0xFA, 0xAF);
-	gdt_set_gate(4, 0, 0XFFFFFFFF, 0xF2, 0xCF);
+	gdt_set_gate(3, 0, 0XFFFFFFFF, 0xFA, CODE_SEG);
+	gdt_set_gate(4, 0, 0XFFFFFFFF, 0xF2, DATA_SEG);
 
-	gdt_set_gate(5, 0, 0xFFFFFFFF, 0xFA, 0xAF);
+	gdt_set_gate(5, 0, 0xFFFFFFFF, 0xFA, CODE_SEG);
 
 	gdt_set_tss(6, reinterpret_cast<uint64_t>(&tss), sizeof(tss_entry) - 1);
 	gdt_flush(reinterpret_cast<uint64_t>(&gdt_ptr));
-	__asm__ __volatile__("ltr %%ax" :: "a"(0x30));
+	__asm__ __volatile__("ltr %%ax" :: "a"(TSS_DESCRIPTOR));
 }
 
 
@@ -71,7 +72,7 @@ void idt_set_descriptor(uint8_t v, void *isr, uint8_t flags) {
 	idt_entry *descriptor{ &idt[v] };
 
 	descriptor->isr_low    = reinterpret_cast<uint64_t>(isr) & 0xFFFF;
-	descriptor->kernel_cs  = 0x08;
+	descriptor->kernel_cs  = KERNEL_CS;
 	descriptor->ist        = 0;
 	descriptor->attributes = flags;
 	descriptor->isr_mid    = (reinterpret_cast<uint64_t>(isr) >> 16) & 0xFFFF;
@@ -84,15 +85,15 @@ void init_idt() {
 	idtr.base = reinterpret_cast<uintptr_t>(&idt[0]);
 
 	for (uint8_t v{}; v < 32; ++v) {
-		idt_set_descriptor(v, isr_stub_table[v], 0x8E);
+		idt_set_descriptor(v, isr_stub_table[v], IDT_INT_GATE);
 		vectors[v] = true;
 	}
 
 	__asm__ __volatile__ ("lidt %0" : : "m"(idtr));
 	
-	idt_set_descriptor(14, reinterpret_cast<void*>(handle_page_fault), 0x8E);
-	idt_set_descriptor(32, reinterpret_cast<void*>(timer_isr), 0x8E);
-	idt_set_descriptor(33, reinterpret_cast<void*>(keyboard_isr), 0x8E);
+	idt_set_descriptor(PAGEFAULT_CODE, reinterpret_cast<void*>(handle_page_fault), IDT_INT_GATE);
+	idt_set_descriptor(32, reinterpret_cast<void*>(timer_isr), IDT_INT_GATE);
+	idt_set_descriptor(33, reinterpret_cast<void*>(keyboard_isr), IDT_INT_GATE);
 }
 
 
@@ -115,6 +116,43 @@ uint16_t inw(uint16_t port) {
 	uint16_t ret;
 	__asm__ __volatile__("inw %1, %0" : "=a"(ret) : "Nd"(port));
 	return ret;
+}
+
+void outl(uint16_t port, uint32_t val) {
+	__asm__ __volatile__("outl %0, %1" : : "a"(val), "Nd"(port));
+}
+
+uint32_t inl(uint16_t port) {
+	uint32_t ret;
+	__asm__ __volatile__("inl %1, %0" : "=a"(ret) : "Nd"(port));
+	return ret;
+}
+
+uint32_t pci_read(uint8_t bus, uint8_t dev, uint8_t func, uint8_t reg) {
+	outl(0xCF8, 0x80000000 | (bus << 16) | (dev << 11) | (func << 8) | (reg & 0xFC));
+	return inl(0xCFC);
+}
+
+void pci_write(uint8_t bus, uint8_t dev, uint8_t func, uint8_t reg, uint32_t val) {
+	outl(0xCF8, 0x80000000 | (bus << 16) | (dev << 11) | (func << 8) | (reg & 0xFC));
+	outl(0xCFC, val);
+}
+
+void pci_scan() {
+	for (uint8_t dev{}; dev < 32; ++ dev) {
+		for (uint8_t func{}; func < 8; ++func) {
+			uint32_t ven{ pci_read(0, dev, func, 0) & 0xFFFF };
+			if (ven == 0xFFFF) continue;
+
+			uint32_t pci     { pci_read(0, dev, func, 8) };
+			uint32_t clss    {  pci >> 24 };
+			uint32_t subclass{ (pci >> 16) & 0xFF };
+			uint32_t prog_if { (pci >>  8) & 0xFF };
+			
+			if (clss == 0x01 && subclass == 0x06 && prog_if == 0x01)
+				ahci_init(pci_read(0, dev, func, 0x24));
+		}
+	}
 }
 
 volatile uint64_t timer_ticks{};
@@ -252,7 +290,7 @@ void handleCmd(const char *cmd, const char *args[MAX_ARG_CNT]) {
 		print("uptime    Prints the uptime of the OS in seconds.\n");
 		print("ver       Prints the current version of BufferOS.\n");
 		print("panic     Deliberately causes a Kernel Panic.\n");
-		print("pagefault Deliberately activates the Page Fault Handler.\n\n");
+		print("pagefault Deliberately activates the Page Fault Handler.\n");
 	}
 	else if (strEqual(cmd, "clear")) {
 		for (int i{}; i < v_pos; ++i)
@@ -278,6 +316,9 @@ void handleCmd(const char *cmd, const char *args[MAX_ARG_CNT]) {
 		panic("Manually triggered by User.");
 	else if (strEqual(cmd, "pagefault"))
 		handle_page_fault();
+
+	if (!strEqual(cmd, "clear"))
+		printCh('\n');
 }
 
 void parseCmd() {
@@ -325,7 +366,7 @@ void parseCmd() {
 	if (!found) {
 		printCh('\'', false);
 		print(args[0], false);
-		print("' does not match any command. Check 'help' to see all commands.\n", false);
+		print("' does not match any command. Check 'help' to see all commands.\n\n", false);
 	}
 }
 
@@ -422,6 +463,7 @@ static uint64_t heap_end;
 
 extern uint8_t _kernel_end;
 uint8_t *bitmap{ &_kernel_end };
+AHCI_INFO drives[32];
 
 void parse_memmap(multiboot_info* mbi) {
 	if (!(mbi->flags & (1 << 6)))
@@ -511,7 +553,7 @@ void init_heap() {
 	write_footer(heap_start, size);
 }
 
-uint64_t kmalloc(const uint64_t size) {
+uint64_t kmalloc(const uint64_t size, const uint64_t alignment) {
 	uint64_t addr{ heap_start };
 	while (addr < heap_end) {
 		chunk_header *curr{ reinterpret_cast<chunk_header*>(addr) };
@@ -520,26 +562,40 @@ uint64_t kmalloc(const uint64_t size) {
 			continue;
 		}
 
+		// Set return address to the address of usable space and add padding to size
+		uint64_t return_addr{ addr + sizeof(chunk_header) };
+		uint64_t padding    { return_addr % alignment };
+		curr->size += padding;
+
 		if (curr->size >= size) {
 			if (curr->size - size < MIN_MALLOC_SIZE) {
 				curr->is_free = false;
-				return addr + sizeof(chunk_header);
+				return return_addr;
 			}
 			else {
+				// Segment into 2 pieces, first is what we'll use, second is leftovers
+
+				// First we take the new size, which is the size of the entire chunk (curr->size)
+				// - the size we're going to keep - the header the leftover piece is going to use
+				// - the footer of our piece
 				uint64_t new_size{ curr->size - size - sizeof(chunk_header) - sizeof(chunk_footer) };
 				curr->size = size;
 
+				// The new header is placed after our current piece + our header and footer
 				uint64_t new_header_addr{ addr + next_header(curr->size) };
 				chunk_header *new_header{ write_header(new_header_addr, new_size, true) };
 
+				// New footer is placed at the header address + header size + size
+				// Remove footer since next_header adds it
 				uint64_t new_footer_addr{ new_header_addr + next_header(new_header->size) - sizeof(chunk_footer) };
 				write_footer(new_footer_addr, new_size);
 
+				// Our footer is placed at the address + our size + the size of the header
 				uint64_t curr_footer_addr{ addr + curr->size + sizeof(chunk_header) };
 				write_footer(curr_footer_addr, curr->size);
 
 				curr->is_free = false;
-				return addr + sizeof(chunk_header);
+				return return_addr;
 			}
 		}
 
@@ -550,6 +606,7 @@ uint64_t kmalloc(const uint64_t size) {
 }
 
 void kfree(const uint64_t addr) {
+	// Subtract size of chunk header from addr to get the header
 	chunk_header *curr{ reinterpret_cast<chunk_header*>(addr - sizeof(chunk_header)) };
 	if (curr->is_free)
 		panic("Attempted to double free heap space");
@@ -580,6 +637,11 @@ void kfree(const uint64_t addr) {
 void memcpy(void *dest, const void *src, const uint64_t n) {
 	for (uint64_t i{}; i < n; ++i)
 		reinterpret_cast<volatile uint8_t*>(dest)[i] = reinterpret_cast<const uint8_t*>(src)[i];
+}
+
+void memset(void *addr, const uint64_t val, const uint64_t count) {
+	for (uint64_t i{}; i < count; ++i)
+		reinterpret_cast<volatile uint8_t*>(addr)[i] = val;
 }
 
 
@@ -851,6 +913,7 @@ extern "C" void kernel_main(uint32_t multiboot_info_addr) {
 	init_syscalls();
 	remap_pic();
 	init_idt();
+	pci_scan();
 
 	pit_set_freq(PIT_FREQ);
 	__asm__ __volatile__ ("sti");

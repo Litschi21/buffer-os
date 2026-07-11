@@ -15,9 +15,13 @@ bool ata_init() {
 		status = inb(base + 7);
 	
 	if (status & 0x08) { // 0x08 = good, drive info found
-		// uint16_t buf[256];
-		// for (uint16_t i{}; i < 256; ++i)
+		// uint8_t buf[256];
+		// uint8_t i{};
+		//
+		// do {
 		// 	buf[i] = inw(base);
+		// 	++i;
+		// } while (i != 255);
 		
 		return true;
 	}
@@ -40,8 +44,11 @@ bool ata_read(uint8_t drive, uint64_t lba, void *buf, uint16_t sectors) {
 		while (inb(base + 7) & 0x80); // Again, waiting on slow, busy drive
 		if    (inb(base + 7) & 0x01) return false;
 		
-		for (uint16_t i{}; i < 256; ++i)
-			reinterpret_cast<uint16_t*>(buf)[i] = inw(base);
+		uint8_t i{};
+		do {
+			reinterpret_cast<uint8_t*>(buf)[i] = inw(base);
+			++i;
+		} while (i != 255);
 
 		buf = reinterpret_cast<uint8_t*>(buf) + 512;
 	}
@@ -64,8 +71,10 @@ bool ata_write(uint8_t drive, uint64_t lba, void *buf, uint16_t sectors) {
 		while (inb(base + 7) & 0x80);
 		if (inb(base + 7) & 0x01) return false;
 		
-		for (uint16_t i{}; i < 256; ++i)
-			outw(base, reinterpret_cast<uint16_t*>(buf)[i]);
+		uint8_t i{};
+		do {
+			outw(base, reinterpret_cast<uint8_t*>(buf)[i]);
+		} while(i != 255);
 		
 		buf = reinterpret_cast<uint8_t*>(buf) + 512;
 	}

@@ -2,8 +2,17 @@
 
 #include <stdint.h>
 
-#define GDT_SIZE                  9
+#define GDT_SIZE                  8
+#define GDT_ENTRY_SIZE            8
+#define CODE_SEG                  0xAF
+#define DATA_SEG                  0xCF
+#define TSS_BYTES_USED            2
+#define TSS_DESCRIPTOR            (GDT_SIZE - TSS_BYTES_USED) * GDT_ENTRY_SIZE
+
 #define IDT_SIZE                  256
+#define KERNEL_CS                 0x08
+#define PAGEFAULT_CODE           14
+#define IDT_INT_GATE              0x8E
 
 #define PIT_FREQ                  200
 
@@ -23,15 +32,19 @@
 #define TASK_STATE_RUNNING        1
 #define TASK_STATE_DEAD           2
 
-#define PML4_IDX(addr) (((addr) >> 39) & 0x1FF)
-#define PDPT_IDX(addr) (((addr) >> 30) & 0x1FF)
-#define PD_IDX(addr)   (((addr) >> 21) & 0x1FF)
-#define PT_IDX(addr)   (((addr) >> 12) & 0x1FF)
+#define PML4_IDX(addr)            (((addr) >> 39) & 0x1FF)
+#define PDPT_IDX(addr)            (((addr) >> 30) & 0x1FF)
+#define PD_IDX(addr)              (((addr) >> 21) & 0x1FF)
+#define PT_IDX(addr)              (((addr) >> 12) & 0x1FF)
 
-#define PAGE_PRESENT   (1ULL << 0)
-#define PAGE_WRITE     (1ULL << 1)
-#define PAGE_USER      (1ULL << 2)
-#define PAGE_BASE_MASK 0x000FFFFFFFFFF000ULL
+#define PAGE_PRESENT              (1ULL << 0)
+#define PAGE_WRITE                (1ULL << 1)
+#define PAGE_USER                 (1ULL << 2)
+#define PAGE_BASE_MASK            0x000FFFFFFFFFF000ULL
+
+#define ADDR_PORT                 0xCF8
+#define DATA_PORT                 0xCFC
+
 
 // --- GDT SECTION ---
 struct __attribute__((packed)) gdt_entry {
@@ -116,6 +129,11 @@ void outb(uint16_t port, uint8_t val);
 uint8_t inb(uint16_t port);
 void outw(uint16_t port, uint16_t val);
 uint16_t inw(uint16_t port);
+void outl(uint16_t port, uint32_t val);
+uint32_t inl(uint16_t port);
+uint32_t pci_read(uint8_t bus, uint8_t dev, uint8_t func, uint8_t reg);
+void pci_write(uint8_t bus, uint8_t dev, uint8_t func, uint8_t reg, uint32_t val);
+void pci_scan();
 
 extern "C" void timer_handler();
 void pit_set_freq(uint32_t freq);
@@ -143,6 +161,17 @@ void shell();
 
 
 // --- MALLOC & FREE SECTION ---
+struct AHCI_INFO {
+	uint64_t sectors;
+	uint16_t sector_size;
+	
+	char model[41];
+	char serial[21];
+	char firmware[9];
+
+	bool lba48;
+};
+
 struct __attribute__((packed)) multiboot_info {
     uint32_t flags;
     uint32_t mem_lower;
@@ -174,6 +203,7 @@ struct chunk_footer {
 
 extern uint8_t _kernel_end;
 extern uint8_t *bitmap;
+extern AHCI_INFO drives[32];
 
 void parse_memmap(multiboot_info* mbi);
 uint64_t alloc_frame();
@@ -184,9 +214,10 @@ chunk_header *write_header(uint64_t addr, uint64_t size, bool is_free);
 
 void init_bitmap();
 void init_heap();
-uint64_t kmalloc(uint64_t size);
+uint64_t kmalloc(uint64_t size, const uint64_t alignment = 1);
 void kfree(uint64_t addr);
-extern void memcpy(void *dest, const void *src, uint64_t n);
+void memcpy(void *dest, const void *src, uint64_t n);
+void memset(void *addr, const uint64_t val, const uint64_t count);
 extern "C" void user_enter();
 
 
