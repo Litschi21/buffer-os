@@ -120,5 +120,5 @@ struct HBA_MEM {
 
 extern HBA_CMD_TBL *cmdtbl;
 
-void ahci_init (uint32_t bar5);
-bool ahci_do (uint8_t drive, uint64_t lba, void *buf, uint64_t count, bool write);
+bool ahci_init (uint32_t bar5);
+bool ahci_op (uint8_t drive, uint64_t lba, void *buf, uint64_t count, bool write);

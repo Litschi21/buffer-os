@@ -11,7 +11,7 @@
 
 #define IDT_SIZE                  256
 #define KERNEL_CS                 0x08
-#define PAGEFAULT_CODE           14
+#define PAGEFAULT_CODE            14
 #define IDT_INT_GATE              0x8E
 
 #define PIT_FREQ                  200
@@ -272,7 +272,7 @@ task_t *create_task(void (*entry_point)(), bool is_kernel=false);
 void register_task(task_t *task);
 
 
-// Paging
+// --- PAGING SECTION ---
 extern "C" void handle_page_fault();
 uint64_t create_page();
 bool check_subtable(const uint64_t *virt, uint64_t idx);
@@ -304,3 +304,14 @@ extern "C" uint64_t handle_syscall(struct syscall_frame *f);
 extern "C" void syscall_entry();
 void init_syscalls();
 extern "C" void kernel_main(uint32_t multiboot_info_addr);
+
+
+// --- BLOCK DEVICE SECTION ---
+struct block_device {
+	uint8_t  drive;
+	uint64_t lba_start;
+	uint64_t sec_count;
+	uint16_t sec_size;
+};
+
+bool block_op(block_device *dev, uint64_t sec, void *buf, uint64_t count, bool write);

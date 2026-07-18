@@ -6,7 +6,8 @@ static volatile HBA_MEM *abar;
 HBA_CMD_HDR *cmd_hdr;
 HBA_CMD_TBL *cmdtbl;
 
-void ahci_init(uint32_t bar5) {
+bool ahci_init(uint32_t bar5) {
+	bool drive_init{ false };
 	map_page(get_pml4(), VIRT_ADDR, bar5, PAGE_PRESENT | PAGE_WRITE);
 
 	abar = reinterpret_cast<volatile HBA_MEM*>(VIRT_ADDR);
@@ -16,11 +17,11 @@ void ahci_init(uint32_t bar5) {
 	while (abar->ghc & 1);
 	if (abar->pi == 0) {
 		print("WARNING: No AHCI ports found, disk access not available!\n\n");
-		return;
+		return false;
 	}
 
 	for (uint8_t i{}; i < 32; ++i) {
-		if (!(abar->pi & (1u << i))) continue;	
+		if (!(abar->pi & (1u << i))) continue;
 	
 		volatile HBA_PORT *port_ptr{ &abar->ports[i] };
 		port_ptr->cmd &= ~(1u << 0); // Stop command list processing
@@ -28,8 +29,18 @@ void ahci_init(uint32_t bar5) {
 
 		// Wait for FR and CR bits to clear
 		while (port_ptr->cmd & (1u << 14) || port_ptr->cmd & (1u << 15));
+
+		// Perform COMRESET
+		port_ptr->sctl = 1;
+		sleep(5);
+		port_ptr->sctl = 0;
+
+		while ((port_ptr->ssts & 0xF) != 0x3);
+		port_ptr->is = port_ptr->is;
 		
 		if (port_ptr->sig == 0x101) {
+			drive_init = true;
+
 			// Alloc CLB and FB
 			uint64_t clb_addr{ kmalloc(1024, 1024) };
 			memset(reinterpret_cast<void*>(clb_addr), 0, 1024);
@@ -49,7 +60,7 @@ void ahci_init(uint32_t bar5) {
 
 			// Check TFD, bit 7 = busy, bit 3 = data request, bit 0 = err
 			while (port_ptr->tfd & (1u << 7) || port_ptr->tfd & (1u << 3));
-			if (port_ptr->tfd & (1u << 0)) return;
+			if (port_ptr->tfd & (1u << 0)) return false;
 
 			// Send IDENTIFY cmd
 			// Define command header
@@ -108,6 +119,8 @@ void ahci_init(uint32_t bar5) {
 			drives[i].firmware[8] = '\0';
 		}
 	}
+	
+	return drive_init;
 }
 
 bool ahci_op(uint8_t drive, uint64_t lba, void *buf, uint64_t count, bool write) {

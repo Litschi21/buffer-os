@@ -1,5 +1,6 @@
 #include "ahci.hpp"
 #include "elf.hpp"
+#include "fat32.hpp"
 #include "kernel.hpp"
 #include <stdint.h>
 
@@ -149,8 +150,10 @@ void pci_scan() {
 			uint32_t subclass{ (pci >> 16) & 0xFF };
 			uint32_t prog_if { (pci >>  8) & 0xFF };
 			
-			if (clss == 0x01 && subclass == 0x06 && prog_if == 0x01)
-				ahci_init(pci_read(0, dev, func, 0x24));
+			if (clss == 0x01 && subclass == 0x06 && prog_if == 0x01) {
+				if (ahci_init(pci_read(0, dev, func, 0x24)))
+					fat32_init();
+			}
 		}
 	}
 }
@@ -171,7 +174,7 @@ void pit_set_freq(uint32_t freq) {
 }
 
 void sleep(uint64_t ms) {
-	uint64_t target{ timer_ticks + (ms / 10) };
+	uint64_t target{ timer_ticks + (ms / (1000 / PIT_FREQ)) };
 	while (timer_ticks < target)
 		__asm__ __volatile__("hlt");
 }
@@ -422,6 +425,7 @@ void print(const char *msg, const bool await_input, const int color_code) {
 
 void shell() {
 	__asm__ __volatile__("sti");
+
 	print("BufferOS\n", true);
 	while (true) {
 		if (!kb_empty()) {
@@ -793,7 +797,7 @@ void register_task(task_t *task) {
 }
 
 
-// Paging
+// --- PAGING SECTION ---
 extern "C" void handle_page_fault() {
 	__asm__ __volatile__("cli");
 
@@ -898,6 +902,12 @@ void init_syscalls() {
 	write_msr(0xC0000102, reinterpret_cast<uint64_t>(&cpu_data));
 }
 
+
+// --- BLOCK DEVICE SECTION ---
+bool block_op(block_device *dev, uint64_t sec, void *buf, uint64_t count, bool write) {
+	return ahci_op(dev->drive, dev->lba_start + sec, buf, count, write);
+}
+
 extern "C" void kernel_main(uint32_t multiboot_info_addr) {
 	parse_memmap(reinterpret_cast<multiboot_info*>(multiboot_info_addr));
 	init_bitmap();
@@ -913,11 +923,11 @@ extern "C" void kernel_main(uint32_t multiboot_info_addr) {
 	init_syscalls();
 	remap_pic();
 	init_idt();
-	pci_scan();
 
 	pit_set_freq(PIT_FREQ);
 	__asm__ __volatile__ ("sti");
 
+	pci_scan();
 	while (true) {
 		__asm__ __volatile__("hlt");
 	}
