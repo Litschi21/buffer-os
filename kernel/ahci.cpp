@@ -14,7 +14,9 @@ bool ahci_init(uint32_t bar5) {
 	abar->ghc |= (1u << 31);
 	abar->ghc |= 1;
 
-	while (abar->ghc & 1);
+	uint64_t start{ timer_ticks };
+	while (abar->ghc & 1 && timer_ticks - start < PIT_FREQ / 20);
+
 	if (abar->pi == 0) {
 		print("WARNING: No AHCI ports found, disk access not available!\n\n");
 		return false;
@@ -28,16 +30,18 @@ bool ahci_init(uint32_t bar5) {
 		port_ptr->cmd &= ~(1u << 4); // Stop FIS receiver
 
 		// Wait for FR and CR bits to clear
-		while (port_ptr->cmd & (1u << 14) || port_ptr->cmd & (1u << 15));
+		start = timer_ticks;
+		while ((port_ptr->cmd & (1u << 14) || port_ptr->cmd & (1u << 15)) && timer_ticks - start < PIT_FREQ / 20);
 
 		// Perform COMRESET
 		port_ptr->sctl = 1;
 		sleep(5);
 		port_ptr->sctl = 0;
 
-		while ((port_ptr->ssts & 0xF) != 0x3);
+		start = timer_ticks;
+		while ((port_ptr->ssts & 0xF) != 0x3 && timer_ticks - start < PIT_FREQ / 20);
 		port_ptr->is = port_ptr->is;
-		
+
 		if (port_ptr->sig == 0x101) {
 			drive_init = true;
 

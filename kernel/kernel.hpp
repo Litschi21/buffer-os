@@ -41,6 +41,7 @@
 #define PAGE_WRITE                (1ULL << 1)
 #define PAGE_USER                 (1ULL << 2)
 #define PAGE_BASE_MASK            0x000FFFFFFFFFF000ULL
+#define PAGE_SIZE_BIT             (1ULL << 7)
 
 #define ADDR_PORT                 0xCF8
 #define DATA_PORT                 0xCFC
@@ -113,7 +114,7 @@ extern "C" void timer_isr();
 extern "C" void keyboard_isr();
 extern "C" void handle_page_fault();
 
-extern "C" void exception_handler();
+extern "C" void exception_handler(uint64_t *frame);
 void idt_set_descriptor(uint8_t v, void *isr, uint8_t flags);
 void init_idt();
 
@@ -266,14 +267,13 @@ void task_exit();
 void map_page(uint64_t *pml4_virt, uint64_t virt_addr, uint64_t phys_addr, uint64_t flags);
 uint64_t *get_pml4();
 void set_task_vals(task_t *task, void *stack_bot);
-void push_stack_vals(uint64_t *stack_ptr, uint64_t user_stack_virt, void (*entry_point)());
+void push_stack_vals(uint64_t *&stack_ptr, uint64_t user_stack_virt, void (*entry_point)());
 void set_ctx_regs(task_t *task, uint64_t *stack_ptr);
 task_t *create_task(void (*entry_point)(), bool is_kernel=false);
 void register_task(task_t *task);
 
 
 // --- PAGING SECTION ---
-extern "C" void handle_page_fault();
 uint64_t create_page();
 bool check_subtable(const uint64_t *virt, uint64_t idx);
 inline uint64_t create_bitmasks();
@@ -297,7 +297,11 @@ enum class SYS {
 	exec,
 	sleep,
 	getpid,
-	uptime
+	uptime,
+	video_write,
+	video_clear,
+	kb_read,
+	kb_empty
 };
 
 extern "C" uint64_t handle_syscall(struct syscall_frame *f);

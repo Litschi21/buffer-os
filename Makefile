@@ -46,13 +46,12 @@ iso: buffer.bin
 
 run: iso
 	qemu-img create -f raw disk.img 64M
-	mkfs.fat -F 32 disk.img
+	printf "label: dos\ntype=c" | sfdisk disk.img
+	mkfs.fat -F 32 --offset 2048 disk.img
 
 	qemu-system-x86_64 -drive file=disk.img,if=none,id=disk,format=raw \
-		-device ide-hd,drive=disk,bus=ide.0 -cdrom buffer.iso \
+		-device ahci,id=ahci -device ide-hd,drive=disk,bus=ahci.0 -cdrom buffer.iso \
 		-machine q35 -boot d
 
 clean:
 	rm -f kernel/*.o buffer.bin buffer.iso iso/boot/buffer.bin
-
-.PHONY: all iso run clean

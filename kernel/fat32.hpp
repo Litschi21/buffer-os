@@ -14,8 +14,9 @@ struct __attribute__((packed)) PART_Entry {
 };
 
 struct __attribute__((packed)) MBR {
-	PART_Entry entries[4];  // Partition entries 1 - 4
-	uint16_t   boot_sig;    // MUST be 0x55AA, because IBM chose that magic number
+	uint8_t    bootstrap[446]; 
+	PART_Entry entries[4];     // Partition entries 1 - 4
+	uint16_t   boot_sig;       // MUST be 0x55AA, because IBM chose that magic number
 };
 
 struct __attribute__((packed)) FSInfo {
@@ -74,7 +75,24 @@ struct __attribute__((packed)) FAT32_Info {
 	BPB bpb;
 };
 
+struct __attribute__((packed)) DIR_Entry {
+	uint8_t  filename[8];
+	uint8_t  file_ext[3];
+	uint8_t  attr;
+	uint8_t  res0;
+	uint8_t  crt_tenths;
+	uint16_t crt_time;
+	uint16_t crt_date;
+	uint16_t last_accessed;
+	uint16_t first_cls_high;
+	uint16_t last_write_time;
+	uint16_t last_write_date;
+	uint16_t first_cls_low;
+	uint32_t file_size;
+};
+
 extern FAT32_Info partitions[4];
 
 bool check_entry(PART_Entry entry);
 void fat32_init();
+void read_dir(uint64_t cls);

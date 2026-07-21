@@ -8,38 +8,41 @@ user_enter:
 	iretq
 
 swtch_ctx:
-	test rdi, rdi
+	mov r8, rdi
+	mov r9, rsi
+
+	test r8, r8
     jz .load_new_ctx
 
-    mov [rdi + 8],  rbx
-    mov [rdi + 16], rcx
-    mov [rdi + 24], rdx
-    mov [rdi + 32], rsi
-    mov [rdi + 40], rdi
-    mov [rdi + 48], rbp
+ 	mov [r8 + 8],  rbx
+    mov [r8 + 16], rcx
+    mov [r8 + 24], rdx
+    mov [r8 + 32], rsi
+    mov [r8 + 40], rdi
+    mov [r8 + 48], rbp
 
     lea rax, [rsp + 8]
-    mov [rdi + 56], rax
+    mov [r8 + 56], rax
 
     mov rax, [rsp]
-    mov [rdi + 64], rax
+    mov [r8 + 64], rax
 
     pushfq
-    pop qword [rdi + 72]
+    pop qword [r8 + 72]
 
 .load_new_ctx:
-    push qword [rsi + 72]
+    push qword [r9 + 72]
     popfq
 
-    mov rbx, [rsi + 8]
-    mov rcx, [rsi + 16]
-    mov rdx, [rsi + 24]
-    mov rdi, [rsi + 40]
-    mov rbp, [rsi + 48]
+    mov rbx, [r9 + 8]
+    mov rcx, [r9 + 16]
+    mov rdx, [r9 + 24]
+    mov rdi, [r9 + 40]
+    mov rbp, [r9 + 48]
 
-    mov rsp, [rsi + 56]
-    push qword [rsi + 64]
+    mov rsp, [r9 + 56]
+    push qword [r9 + 64]
     
-    mov rax, [rsi + 0]
-    mov rsi, [rsi + 32]
+    mov rax, [r9 + 0]
+    mov rsi, [r9 + 32]
     ret

@@ -65,7 +65,42 @@ static bool      vectors[IDT_SIZE];
 static idt_entry idt[IDT_SIZE];
 static idtr_t    idtr;
 
-extern "C" void exception_handler() {
+extern "C" void exception_handler(uint64_t *frame) {
+	uint64_t error_code{ frame[15] };
+	uint64_t rip       { frame[16] };
+	uint64_t cs        { frame[17] };
+
+	if ((cs & 3) == 3) {
+		print("EXITING TASK");
+		task_exit();
+		return;
+	}
+
+	for (int i{}; i < VID_BFR_ROW_LEN * VID_ROWS; i += 2) {
+		video[i]      = ' ';
+		video[i + 1]  = 0x1F;
+	}
+	
+	uint64_t faulty_addr;
+	__asm__ __volatile__("mov %%cr2, %0" : "=r"(faulty_addr));
+
+	char buf[20];
+	print("*** EXCEPTION CALLED FROM RING 0 ***\n", false, 0x1F);
+
+	print("Address 0x", false, 0x1F);
+	print(to_string(rip, buf), false, 0x1F);
+	printCh('\n');
+
+	print("Faulty Address 0x", false, 0x1F);
+	print(to_string(faulty_addr, buf), false, 0x1F);
+	printCh('\n');
+
+	print("Error Code ", false, 0x1F);
+	print(to_string(error_code, buf), false, 0x1F);
+	printCh('\n');
+
+	print(to_string(cs, buf), false, 0x1F);
+
 	__asm__ __volatile__ ("cli; hlt");
 }
 
@@ -92,7 +127,6 @@ void init_idt() {
 
 	__asm__ __volatile__ ("lidt %0" : : "m"(idtr));
 	
-	idt_set_descriptor(PAGEFAULT_CODE, reinterpret_cast<void*>(handle_page_fault), IDT_INT_GATE);
 	idt_set_descriptor(32, reinterpret_cast<void*>(timer_isr), IDT_INT_GATE);
 	idt_set_descriptor(33, reinterpret_cast<void*>(keyboard_isr), IDT_INT_GATE);
 }
@@ -220,7 +254,7 @@ extern "C" void keyboard_handler() {
 
 // --- SHELL SECTION ---
 static const char *commands[]{
-	"help", "clear", "echo", "uptime", "ver", "panic", "pagefault"
+	"help", "clear", "echo", "uptime", "ver", "ls", "panic"
 };
 
 char curr_input[256]{};
@@ -292,33 +326,29 @@ void handleCmd(const char *cmd, const char *args[MAX_ARG_CNT]) {
 		print("echo      Prints all given arguments.\n");
 		print("uptime    Prints the uptime of the OS in seconds.\n");
 		print("ver       Prints the current version of BufferOS.\n");
+		print("ls        Prints \n");
 		print("panic     Deliberately causes a Kernel Panic.\n");
-		print("pagefault Deliberately activates the Page Fault Handler.\n");
-	}
-	else if (strEqual(cmd, "clear")) {
+	} else if (strEqual(cmd, "clear")) {
 		for (int i{}; i < v_pos; ++i)
 			video[i] = 0;
 		
 		v_pos = 0;
 		print("BufferOS\n");
-	}
-	else if (strEqual(cmd, "echo")) {
+	} else if (strEqual(cmd, "echo")) {
 		for (uint64_t i{ 1 }; i < MAX_ARG_CNT && args[i] != nullptr; ++i) {
 			print(args[i]);
 			printCh('\n');
 		}
-	}
-	else if (strEqual(cmd, "uptime")) {
+	} else if (strEqual(cmd, "uptime")) {
 		char buf[MAX_64_BIT_DIG];
 		print(to_string(timer_ticks / PIT_FREQ, buf));
 		print("s\n");
-	}
-	else if (strEqual(cmd, "ver"))
+	} else if (strEqual(cmd, "ver"))
 		print("BufferOS Pre-Alpha\n");
 	else if (strEqual(cmd, "panic"))
 		panic("Manually triggered by User.");
-	else if (strEqual(cmd, "pagefault"))
-		handle_page_fault();
+	else if (strEqual(cmd, "ls"))
+		read_dir(partitions[0].bpb.cls_num);
 
 	if (!strEqual(cmd, "clear"))
 		printCh('\n');
@@ -336,8 +366,7 @@ void parseCmd() {
 		if (curr_ch != ' ') {
 			if (char_idx < sizeof(word_buffer[0]) - 1)
 				word_buffer[arg_idx][char_idx++] = curr_ch;
-		}
-		else {
+		} else {
 			if (char_idx > 0) {
 				word_buffer[arg_idx][char_idx] = '\0';
 				args[arg_idx] = word_buffer[arg_idx];
@@ -345,7 +374,7 @@ void parseCmd() {
 
 				char_idx = 0;
 				if (arg_idx >= MAX_ARG_CNT) break;
-			}
+				}
 		}
 	}
 
@@ -395,8 +424,7 @@ void printCh(char c, const bool await_input, const int color_code) {
 		if (await_input) {
 			print("> ", false);
 		}
-	}
-	else if (c == '\b') {
+	} else if (c == '\b') {
 		if ((v_pos - 2) % VID_BFR_ROW_LEN < 3)
 			return;
 		else
@@ -409,8 +437,7 @@ void printCh(char c, const bool await_input, const int color_code) {
 			--line_len;
 			curr_input[line_len] = '\0';
 		}
-	}
-	else {
+	} else {
 		video[v_pos]     = c;
 		video[v_pos + 1] = color_code;
 		v_pos += 2;
@@ -424,6 +451,9 @@ void print(const char *msg, const bool await_input, const int color_code) {
 }
 
 void shell() {
+	uint16_t cs_val;
+	__asm__ __volatile__("mov %%cs, %0" : "=r"(cs_val));
+
 	__asm__ __volatile__("sti");
 
 	print("BufferOS\n", true);
@@ -441,8 +471,7 @@ void shell() {
 
 				line_len = 0;
 				print("> ");
-			}
-			else if (c == '\b')
+			} else if (c == '\b')
 				printCh('\b');
 			else {
 				if (line_len < 255) {
@@ -575,8 +604,7 @@ uint64_t kmalloc(const uint64_t size, const uint64_t alignment) {
 			if (curr->size - size < MIN_MALLOC_SIZE) {
 				curr->is_free = false;
 				return return_addr;
-			}
-			else {
+			} else {
 				// Segment into 2 pieces, first is what we'll use, second is leftovers
 
 				// First we take the new size, which is the size of the entire chunk (curr->size)
@@ -694,8 +722,7 @@ void schedule() {
 
 	if (!old_task) {
 		swtch_ctx(nullptr, &(next_task->ctx));
-	}
-	else {
+	} else {
 		if (old_task->state == TASK_STATE_RUNNING)
 			old_task->state = TASK_STATE_READY;
 
@@ -732,7 +759,7 @@ void set_task_vals(task_t *task, void *stack_bot) {
 	task->ctx.rflags = 0;
 }
 
-void push_stack_vals(uint64_t *stack_ptr, uint64_t user_stack_virt, void (*entry_point)()) {
+void push_stack_vals(uint64_t *&stack_ptr, uint64_t user_stack_virt, void (*entry_point)()) {
 	*(--stack_ptr) = 0x23;
 	*(--stack_ptr) = user_stack_virt + 4096;
 	*(--stack_ptr) = 0x202;
@@ -788,8 +815,7 @@ void register_task(task_t *task) {
 		task_list_tail = task;
 		curr_task = task;
 		task->next = task;
-	}
-	else {
+	} else {
 		task_list_tail->next = task;
 		task->next = task_list_head;
 		task_list_tail = task;
@@ -798,28 +824,6 @@ void register_task(task_t *task) {
 
 
 // --- PAGING SECTION ---
-extern "C" void handle_page_fault() {
-	__asm__ __volatile__("cli");
-
-	uint64_t faulty_addr;
-	__asm__ __volatile__("mov %%cr2, %0" : "=r"(faulty_addr));
-	for (int i{}; i < VID_BFR_ROW_LEN * VID_ROWS; i += 2) {
-		video[i]      = ' ';
-		video[i + 1]  = 0x4F;
-	}
-
-	v_pos = 0;
-	print("*** PAGE FAULT ***\n\n", false, 0x4F);
-	print("CPU attempted access of a non-mapped or non-permitted memory page.\n", false, 0x4F);
-
-	char buf[20];
-	print("Faulty Address: 0x", false, 0x4F);
-	print(to_string(faulty_addr, buf), false, 0x4F);
-	printCh('\n', false, 0x4F);
-
-	while (true) { __asm__ __volatile__("hlt"); }
-}
-
 uint64_t create_page() {
 	uint64_t phys_table{ alloc_frame() };
 	uint64_t *virt_table{ reinterpret_cast<uint64_t*>(phys_table) };
@@ -828,8 +832,14 @@ uint64_t create_page() {
 	return phys_table;
 }
 
-bool check_subtable(const uint64_t *virt, const uint64_t idx) { return !(virt[idx] & PAGE_PRESENT); }
-inline uint64_t create_bitmasks() { return create_page() | PAGE_PRESENT | PAGE_WRITE | PAGE_USER; }
+bool check_subtable(const uint64_t *virt, const uint64_t idx) {
+	return !(virt[idx] & PAGE_PRESENT);
+}
+
+inline uint64_t create_bitmasks() {
+	return create_page() | PAGE_PRESENT | PAGE_WRITE | PAGE_USER;
+}
+
 uint64_t *create_pt_entry(const uint64_t *virt, const uint64_t idx) {
 	return reinterpret_cast<uint64_t*>(virt[idx] & PAGE_BASE_MASK);
 }
@@ -851,6 +861,18 @@ void map_page(uint64_t *pml4_virt, uint64_t virt_addr, uint64_t phys_addr, uint6
 
 	uint64_t *pd{ create_pt_entry(pdpt, pdpt_idx) };
 	uint64_t pd_idx = PD_IDX(virt_addr);
+	if (pd[pd_idx] & PAGE_SIZE_BIT) {
+		uint64_t *new_pt{ reinterpret_cast<uint64_t*>(create_page()) };
+		uint64_t new_flags{ (pd[pd_idx] & 0xFFF) & ~(1 << 7) };
+
+		uint64_t base{ pd[pd_idx] & PAGE_BASE_MASK };
+		for (int i{}; i < 512; ++i) {
+			new_pt[i] = (base + i * 0x1000) | new_flags;
+		}
+
+		pd[pd_idx] = reinterpret_cast<uint64_t>(new_pt) | new_flags;
+	}
+
 	subtable_bitmask_check(pd, pd_idx);
 
 	uint64_t *pt{ create_pt_entry(pd, pd_idx) };
@@ -882,6 +904,20 @@ extern "C" uint64_t handle_syscall(struct syscall_frame *f) {
 		return curr_task->pid;
 	case SYS::uptime:
 		return timer_ticks;
+	case SYS::video_write:
+		print(reinterpret_cast<const char*>(f->rdi));
+		break;
+	case SYS::video_clear: {
+		const char *args[MAX_ARG_CNT]{};
+		args[0] = "clear";
+
+		handleCmd(args[0], args);
+		break;
+	}
+	case SYS::kb_read:
+		return kb_read();
+	case SYS::kb_empty:
+		return kb_empty();
 	default:
 		return -1;
 	}
@@ -896,7 +932,7 @@ static void write_msr(uint32_t msr, uint64_t val) {
 }
 
 void init_syscalls() {
-	write_msr(0xC0000081, (static_cast<uint64_t>(0x18) << 32) | static_cast<uint64_t>(0x08));
+	write_msr(0xC0000081, (static_cast<uint64_t>(0x08) << 32) | static_cast<uint64_t>(0x08));
 	write_msr(0xC0000082, reinterpret_cast<uint64_t>(syscall_entry));
 	write_msr(0xC0000084, 0x200);
 	write_msr(0xC0000102, reinterpret_cast<uint64_t>(&cpu_data));
@@ -913,12 +949,6 @@ extern "C" void kernel_main(uint32_t multiboot_info_addr) {
 	init_bitmap();
 	init_heap();
 
-	idle_task = create_task(idle_task_func, true);
-	register_task(idle_task);
-	
-	task_t *shell_task{ create_task(shell, true) };
-	register_task(shell_task);
-
 	init_gdt();
 	init_syscalls();
 	remap_pic();
@@ -926,8 +956,14 @@ extern "C" void kernel_main(uint32_t multiboot_info_addr) {
 
 	pit_set_freq(PIT_FREQ);
 	__asm__ __volatile__ ("sti");
-
 	pci_scan();
+
+	idle_task = create_task(idle_task_func, true);
+	register_task(idle_task);
+	
+	task_t *shell_task{ create_task(shell, true) };
+	register_task(shell_task);
+
 	while (true) {
 		__asm__ __volatile__("hlt");
 	}
